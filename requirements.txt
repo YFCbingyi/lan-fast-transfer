@@ -1,0 +1,7 @@
+flask==2.3.3
+flask-socketio==5.3.6
+gevent==23.9.1
+qrcode==7.4.2
+Pillow==10.0.1
+requests==2.31.0
+PyQt5==5.15.10
