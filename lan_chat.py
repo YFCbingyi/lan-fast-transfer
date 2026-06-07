@@ -994,17 +994,16 @@ class LanChatWindow(QMainWindow):
         threading.Thread(target=self.download_and_open_file, args=(file_id, filename), daemon=True).start()
 
     def download_and_open_file(self, file_id, filename):
-        """下载并打开文件"""
+        """下载并打开文件（桌面端与服务同机，使用 127.0.0.1 直连）"""
         try:
             import requests
-            lan_ip = get_lan_ip()
-            download_url = f"http://{lan_ip}:5000/get_file/{file_id}"
+            download_url = f"http://127.0.0.1:5000/get_file/{file_id}"
             save_path = os.path.join(DOWNLOAD_FOLDER, filename)
             
             # 如果文件已存在，直接打开
             if os.path.exists(save_path):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(save_path))
-                self.add_message(f"已打开: {filename}", 'system')
+                signal_emitter.received_text.emit(f"已打开: {filename}", 'system')
                 return
             
             # 下载文件
@@ -1013,11 +1012,12 @@ class LanChatWindow(QMainWindow):
                 with open(save_path, 'wb') as f:
                     f.write(response.content)
                 QDesktopServices.openUrl(QUrl.fromLocalFile(save_path))
-                self.add_message(f"已下载并打开: {filename}", 'system')
+                signal_emitter.received_text.emit(f"已下载并打开: {filename}", 'system')
             else:
-                self.add_message(f"下载失败: {filename}", 'system')
+                signal_emitter.received_text.emit(
+                    f"下载失败: {filename} (HTTP {response.status_code})", 'system')
         except Exception as e:
-            self.add_message(f"打开文件出错: {str(e)}", 'system')
+            signal_emitter.received_text.emit(f"打开文件出错: {str(e)}", 'system')
 
     def send_text(self):
         text = self.text_input.toPlainText().strip()
