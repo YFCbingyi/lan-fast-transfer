@@ -9,8 +9,8 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QPushButton, QFileDialog, QDialog, QScrollArea
 )
-from PyQt5.QtCore import Qt, QEvent, QUrl
-from PyQt5.QtGui import QPixmap, QDesktopServices
+from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtGui import QPixmap
 import qrcode
 from PIL import Image
 from io import BytesIO
@@ -478,21 +478,19 @@ class LanChatWindow(QMainWindow):
             save_path = os.path.join(self.DOWNLOAD_FOLDER, filename)
             
             if os.path.exists(save_path):
-                QDesktopServices.openUrl(QUrl.fromLocalFile(save_path))
-                signal_emitter.received_text.emit(f"已打开: {filename}", 'system')
+                signal_emitter.received_text.emit(f"文件已存在: {filename}", 'system')
                 return
             
             response = requests.get(download_url, timeout=30)
             if response.status_code == 200:
                 with open(save_path, 'wb') as f:
                     f.write(response.content)
-                QDesktopServices.openUrl(QUrl.fromLocalFile(save_path))
-                signal_emitter.received_text.emit(f"已下载并打开: {filename}", 'system')
+                signal_emitter.received_text.emit(f"已下载: {filename}", 'system')
             else:
                 signal_emitter.received_text.emit(
                     f"下载失败: {filename} (HTTP {response.status_code})", 'system')
         except Exception as e:
-            signal_emitter.received_text.emit(f"打开文件出错: {str(e)}", 'system')
+            signal_emitter.received_text.emit(f"下载文件出错: {str(e)}", 'system')
 
     def send_text(self):
         text = self.text_input.toPlainText().strip()

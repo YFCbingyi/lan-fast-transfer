@@ -64,6 +64,7 @@ PHONE_PAGE = """
         button:active { opacity: 0.8; }
         #fileInput { display: none; }
         .file-btn { background: #00b894; }
+        .dir-btn { background: #fdcb6e; color: #2d3436; }
         .status { text-align: center; color: #777; font-size: 12px; padding: 5px; }
         .progress-container { width: 100%; background-color: #e0e0e0; border-radius: 5px; height: 8px; margin-top: 5px; }
         .progress-bar { height: 100%; background-color: #00b894; border-radius: 5px; transition: width 0.3s ease; }
@@ -94,6 +95,8 @@ PHONE_PAGE = """
             <input type="text" id="textInput" placeholder="输入文字..." autocomplete="off">
             <button onclick="sendText()">发送</button>
             <button class="file-btn" onclick="document.getElementById('fileInput').click()">+</button>
+            <button class="dir-btn" onclick="document.getElementById('dirInput').click()">📁</button>
+            <input type="file" id="dirInput" webkitdirectory style="display:none" onchange="sendDirectory(this.files)">
             <input type="file" id="fileInput" onchange="sendFiles(this.files)" multiple>
         </div>
     </div>
@@ -211,6 +214,30 @@ PHONE_PAGE = """
             }
             
             document.getElementById('fileInput').value = '';
+        }
+        
+        function sendDirectory(files) {
+            if (!files || files.length === 0) return;
+            
+            const fileCount = files.length;
+            addStatus(`📁 准备发送目录，共 ${fileCount} 个文件...`);
+            
+            let successCount = 0;
+            let processedCount = 0;
+            
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const displayName = file.webkitRelativePath || file.name;
+                sendSingleFile(file, displayName, fileCount, function(success) {
+                    processedCount++;
+                    if (success) successCount++;
+                    if (processedCount === fileCount) {
+                        addStatus(`✅ 目录发送完成: ${successCount}/${fileCount} 个文件`);
+                    }
+                });
+            }
+            
+            document.getElementById('dirInput').value = '';
         }
         
         function sendSingleFile(file, displayName, totalCount, callback) {
@@ -332,7 +359,8 @@ def upload_file():
     
     file_id = str(uuid.uuid4())[:8]
     filename = file.filename
-    save_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{filename}")
+    safe_filename = os.path.basename(filename.replace('\\', '/'))
+    save_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{safe_filename}")
     file.save(save_path)
     
     phone_uploads[file_id] = save_path
