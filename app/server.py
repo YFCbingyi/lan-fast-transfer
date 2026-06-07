@@ -1,0 +1,405 @@
+import os
+import uuid
+import atexit
+import zipfile
+import tempfile
+from datetime import datetime
+
+from flask import Flask, request, send_from_directory, render_template_string
+from flask_socketio import SocketIO, emit
+import engineio.async_drivers.gevent
+
+from app.config import load_config, DEFAULT_DOWNLOAD_FOLDER
+from app.signal import signal_emitter
+from app.utils import get_lan_ip
+
+config = load_config()
+
+UPLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "LanChatUploads")
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+DOWNLOAD_FOLDER = config.get('download_path', DEFAULT_DOWNLOAD_FOLDER)
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, async_mode='gevent')
+
+temp_downloads = {}
+phone_uploads = {}
+phone_sid = None
+_temp_zip_files = set()
+
+PHONE_PAGE = """
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>局域网文件/消息传输</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+               height: 100vh; display: flex; justify-content: center; align-items: center; }
+        .container { width: 90%; max-width: 400px; background: white; border-radius: 20px;
+                     box-shadow: 0 10px 40px rgba(0,0,0,0.3); overflow: hidden;
+                     display: flex; flex-direction: column; height: 80vh; }
+        .header { background: #6c5ce7; color: white; padding: 15px; text-align: center;
+                  font-size: 18px; font-weight: bold; letter-spacing: 1px; display: flex; align-items: center; justify-content: space-between; }
+        .messages { flex: 1; padding: 15px; overflow-y: auto; background: #f8f9fa;
+                    display: flex; flex-direction: column; }
+        .msg { margin-bottom: 10px; max-width: 80%; word-wrap: break-word; }
+        .msg.local { align-self: flex-end; background: #6c5ce7; color: white;
+                     border-radius: 15px 15px 0 15px; padding: 10px; }
+        .msg.remote { align-self: flex-start; background: white; border: 1px solid #ddd;
+                      border-radius: 15px 15px 15px 0; padding: 10px; }
+        .file-link { color: #6c5ce7; text-decoration: underline; cursor: pointer; }
+        .input-area { display: flex; padding: 10px; background: white; border-top: 1px solid #ddd; }
+        #textInput { flex: 1; border: none; outline: none; font-size: 16px; padding: 8px;
+                     border-radius: 20px; background: #f1f3f5; }
+        button { background: #6c5ce7; color: white; border: none; border-radius: 20px;
+                 padding: 8px 15px; margin-left: 5px; font-size: 14px; cursor: pointer; }
+        button:active { opacity: 0.8; }
+        #fileInput { display: none; }
+        .file-btn { background: #00b894; }
+        .status { text-align: center; color: #777; font-size: 12px; padding: 5px; }
+        .progress-container { width: 100%; background-color: #e0e0e0; border-radius: 5px; height: 8px; margin-top: 5px; }
+        .progress-bar { height: 100%; background-color: #00b894; border-radius: 5px; transition: width 0.3s ease; }
+        .upload-status { font-size: 12px; color: #666; }
+        .about-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
+        .about-content { background: white; width: 90%; max-width: 350px; border-radius: 15px; padding: 20px; max-height: 85vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+        .about-title { font-size: 18px; font-weight: bold; text-align: center; color: #2d3436; margin-bottom: 5px; position: sticky; top: 0; background: white; padding-bottom: 10px; }
+        .about-version { font-size: 12px; color: #636e72; text-align: center; margin-bottom: 15px; }
+        .about-section { margin: 15px 0; }
+        .about-section-title { font-size: 14px; font-weight: bold; color: #2d3436; margin-bottom: 8px; }
+        .about-text { font-size: 12px; color: #636e72; line-height: 1.6; }
+        .privacy-box { background: #f8f9fa; padding: 10px; border-radius: 8px; border-left: 3px solid #00b894; }
+        .disclaimer-box { background: #fff8e6; padding: 10px; border-radius: 8px; border-left: 3px solid #ffc107; }
+        .about-close { width: 100%; padding: 12px; background: #6c5ce7; color: white; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; margin-top: 15px; position: sticky; bottom: 0; }
+        .about-close:active { background: #5a4bd1; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <span style="flex: 1; text-align: center;">📡 局域网传输</span>
+            <span style="font-size: 14px; color: white; cursor: pointer; padding: 0 10px;" onclick="showAbout()">ℹ️ 关于</span>
+        </div>
+        <div class="messages" id="messages">
+            <div class="status">等待连接...</div>
+        </div>
+        <div class="input-area">
+            <input type="text" id="textInput" placeholder="输入文字..." autocomplete="off">
+            <button onclick="sendText()">发送</button>
+            <button class="file-btn" onclick="document.getElementById('fileInput').click()">+</button>
+            <input type="file" id="fileInput" onchange="sendFiles(this.files)" multiple>
+        </div>
+    </div>
+    
+    <div class="about-modal" id="aboutModal">
+        <div class="about-content">
+            <div class="about-title">📡 局域网双向传输</div>
+            <div class="about-version">版本 v2.0</div>
+            
+            <div class="about-section">
+                <div class="about-section-title">🔧 简介</div>
+                <div class="about-text">
+                    一款简洁高效的局域网文件传输工具，支持电脑与手机之间的实时消息和文件互传。
+                </div>
+            </div>
+            
+            <div class="about-section">
+                <div class="about-section-title">✨ 特性</div>
+                <div class="about-text">
+                    • 本地局域网传输，无需互联网<br>
+                    • 支持大文件高速传输<br>
+                    • 实时消息和文件互传
+                </div>
+            </div>
+            
+            <div class="about-section">
+                <div class="about-section-title">🔒 隐私与安全</div>
+                <div class="about-text privacy-box">
+                    ✓ 仅在本地局域网内传输数据<br>
+                    ✓ 不上传数据到远程服务器<br>
+                    ✓ 不收集用户隐私信息<br>
+                    ✓ 不监控剪贴板内容
+                </div>
+            </div>
+            
+            <div class="about-section">
+                <div class="about-section-title">⚠️ 免责声明</div>
+                <div class="about-text disclaimer-box">
+                    本软件为个人免费工具，仅供个人非商业用途使用。作者不对使用本软件造成的任何直接或间接损失负责。
+                </div>
+            </div>
+            
+            <button class="about-close" onclick="hideAbout()">关闭</button>
+        </div>
+    </div>
+    <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+        const messagesDiv = document.getElementById('messages');
+
+        socket.on('connect', () => {
+            addStatus('已连接到电脑');
+        });
+
+        socket.on('disconnect', () => {
+            addStatus('连接断开');
+        });
+
+        socket.on('text_message', (data) => {
+            addMessage(data.message, 'remote');
+        });
+
+        socket.on('file_download', (data) => {
+            const link = `<a class="file-link" href="${data.url}" download>📁 ${data.filename}</a>`;
+            addMessage(link, 'remote');
+        });
+
+        socket.on('upload_status', (data) => {
+            addStatus(data.msg);
+        });
+
+        function addMessage(content, type) {
+            const div = document.createElement('div');
+            div.className = `msg ${type}`;
+            div.innerHTML = content;
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function addStatus(text) {
+            const div = document.createElement('div');
+            div.className = 'status';
+            div.textContent = text;
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function sendText() {
+            const input = document.getElementById('textInput');
+            const text = input.value.trim();
+            if (!text) return;
+            socket.emit('text_message', { message: text });
+            addMessage(text, 'local');
+            input.value = '';
+        }
+
+        function sendFiles(files) {
+            if (!files || files.length === 0) return;
+            
+            const fileCount = files.length;
+            addStatus(`📤 准备上传 ${fileCount} 个文件...`);
+            
+            let successCount = 0;
+            let processedCount = 0;
+            
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                sendSingleFile(file, file.name, fileCount, function(success) {
+                    processedCount++;
+                    if (success) successCount++;
+                    if (processedCount === fileCount) {
+                        addStatus(`✅ 上传完成: ${successCount}/${fileCount} 个文件`);
+                    }
+                });
+            }
+            
+            document.getElementById('fileInput').value = '';
+        }
+        
+        function sendSingleFile(file, displayName, totalCount, callback) {
+            const fileSize = file.size;
+            const fileName = file.name;
+            
+            const statusDiv = document.createElement('div');
+            statusDiv.className = 'status';
+            statusDiv.innerHTML = `📤 正在上传: ${fileName} (<span id="upload-size-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}">0</span>/${formatSize(fileSize)})`;
+            messagesDiv.appendChild(statusDiv);
+            
+            const progressContainer = document.createElement('div');
+            progressContainer.className = 'progress-container';
+            const progressBar = document.createElement('div');
+            progressBar.className = 'progress-bar';
+            progressBar.style.width = '0%';
+            progressContainer.appendChild(progressBar);
+            messagesDiv.appendChild(progressContainer);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/upload', true);
+            
+            const sizeId = `upload-size-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}`;
+            
+            xhr.upload.addEventListener('progress', function(e) {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    progressBar.style.width = percent + '%';
+                    const sizeEl = document.getElementById(sizeId);
+                    if (sizeEl) sizeEl.textContent = formatSize(e.loaded);
+                }
+            });
+            
+            xhr.addEventListener('load', function() {
+                if (xhr.status === 200) {
+                    try {
+                        const data = JSON.parse(xhr.responseText);
+                        if (data.status === 'ok') {
+                            socket.emit('file_uploaded', { file_id: data.file_id, filename: data.filename });
+                            progressBar.style.backgroundColor = '#00b894';
+                            statusDiv.innerHTML = `✅ 上传成功: ${fileName}`;
+                            if (callback) callback(true);
+                        } else {
+                            statusDiv.innerHTML = `❌ 上传失败: ${data.msg || '未知错误'}`;
+                            progressBar.style.backgroundColor = '#e74c3c';
+                            if (callback) callback(false);
+                        }
+                    } catch (err) {
+                        statusDiv.innerHTML = '❌ 上传失败: 解析响应失败';
+                        progressBar.style.backgroundColor = '#e74c3c';
+                        if (callback) callback(false);
+                    }
+                } else {
+                    statusDiv.innerHTML = `❌ 上传失败: HTTP ${xhr.status}`;
+                    progressBar.style.backgroundColor = '#e74c3c';
+                    if (callback) callback(false);
+                }
+            });
+            
+            xhr.addEventListener('error', function() {
+                statusDiv.innerHTML = '❌ 上传失败: 网络错误';
+                progressBar.style.backgroundColor = '#e74c3c';
+                if (callback) callback(false);
+            });
+            
+            xhr.addEventListener('abort', function() {
+                statusDiv.innerHTML = '⏹️ 上传已取消';
+                if (callback) callback(false);
+            });
+            
+            xhr.send(formData);
+        }
+        
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        document.getElementById('textInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendText();
+        });
+        
+        function showAbout() {
+            document.getElementById('aboutModal').style.display = 'flex';
+        }
+        
+        function hideAbout() {
+            document.getElementById('aboutModal').style.display = 'none';
+        }
+        
+        document.getElementById('aboutModal').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('aboutModal')) {
+                hideAbout();
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(PHONE_PAGE)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return {'status': 'error', 'msg': '没有文件'}
+    file = request.files['file']
+    if file.filename == '':
+        return {'status': 'error', 'msg': '空文件名'}
+    
+    file_id = str(uuid.uuid4())[:8]
+    filename = file.filename
+    save_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{filename}")
+    file.save(save_path)
+    
+    phone_uploads[file_id] = save_path
+    
+    return {'status': 'ok', 'filename': filename, 'file_id': file_id}
+
+@app.route('/download/<file_id>')
+def download_file(file_id):
+    if file_id in temp_downloads:
+        filename, filepath = temp_downloads[file_id]
+        return send_from_directory(os.path.dirname(filepath), filename, as_attachment=True)
+    return "文件不存在", 404
+
+@app.route('/get_file/<file_id>')
+def get_file(file_id):
+    if file_id in phone_uploads:
+        filepath = phone_uploads[file_id]
+        return send_from_directory(os.path.dirname(filepath), os.path.basename(filepath), as_attachment=True)
+    return "文件不存在", 404
+
+@socketio.on('connect')
+def handle_connect():
+    global phone_sid
+    from flask import request
+    phone_sid = request.sid
+    print('手机已连接, sid:', phone_sid)
+    signal_emitter.phone_connected.emit(True)
+    signal_emitter.phone_sid_updated.emit(phone_sid)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    global phone_sid
+    print('手机断开连接, sid:', phone_sid)
+    phone_sid = None
+    signal_emitter.phone_connected.emit(False)
+    signal_emitter.phone_sid_updated.emit(None)
+
+@socketio.on('text_message')
+def handle_text_message(data):
+    msg = data.get('message', '')
+    print(f"收到手机文本: {msg}")
+    signal_emitter.received_text.emit(msg, 'phone')
+
+@socketio.on('upload_complete')
+def handle_upload_complete(data):
+    msg = f"📤 手机上传了文件: {data.get('filename')} ({data.get('size')} 字节)"
+    signal_emitter.received_text.emit(msg, 'system')
+
+@socketio.on('file_uploaded')
+def handle_file_uploaded(data):
+    file_id = data.get('file_id')
+    filename = data.get('filename')
+    print(f"手机上传文件完成: {filename}")
+    signal_emitter.received_file.emit(file_id, filename)
+
+def cleanup_temp_files():
+    files_to_remove = list(_temp_zip_files)
+    for path in files_to_remove:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"已清理临时文件: {path}")
+        except Exception as e:
+            print(f"清理临时文件失败 {path}: {e}")
+    _temp_zip_files.clear()
+
+atexit.register(cleanup_temp_files)
+
+def start_flask():
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
