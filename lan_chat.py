@@ -19,6 +19,11 @@ import queue
 import json
 import argparse
 import requests
+import zipfile
+import tempfile
+import shutil
+import atexit
+from datetime import datetime
 from flask import Flask, request, send_from_directory, render_template_string
 from flask_socketio import SocketIO, emit
 import engineio.async_drivers.gevent
@@ -83,6 +88,8 @@ temp_downloads = {}
 phone_uploads = {}
 # 手机客户端的连接 ID（一对一通信）
 phone_sid = None
+# 记录已创建的临时压缩包，用于退出时清理
+_temp_zip_files = set()
 
 # ------------------- 手机端网页（内联 CSS 美化） -------------------
 PHONE_PAGE = """
@@ -148,7 +155,7 @@ PHONE_PAGE = """
             <input type="text" id="textInput" placeholder="输入文字..." autocomplete="off">
             <button onclick="sendText()">发送</button>
             <button class="file-btn" onclick="document.getElementById('fileInput').click()">+</button>
-            <input type="file" id="fileInput" onchange="sendFile(this.files[0])">
+            <input type="file" id="fileInput" onchange="sendFiles(this.files)" multiple>
         </div>
     </div>
     
@@ -248,19 +255,38 @@ PHONE_PAGE = """
             input.value = '';
         }
 
-        function sendFile(file) {
-            if (!file) return;
+        function sendFiles(files) {
+            if (!files || files.length === 0) return;
             
+            const fileCount = files.length;
+            addStatus(`📤 准备上传 ${fileCount} 个文件...`);
+            
+            let successCount = 0;
+            let processedCount = 0;
+            
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                sendSingleFile(file, file.name, fileCount, function(success) {
+                    processedCount++;
+                    if (success) successCount++;
+                    if (processedCount === fileCount) {
+                        addStatus(`✅ 上传完成: ${successCount}/${fileCount} 个文件`);
+                    }
+                });
+            }
+            
+            document.getElementById('fileInput').value = '';
+        }
+        
+        function sendSingleFile(file, displayName, totalCount, callback) {
             const fileSize = file.size;
             const fileName = file.name;
             
-            // 添加上传状态显示
             const statusDiv = document.createElement('div');
             statusDiv.className = 'status';
-            statusDiv.innerHTML = `📤 正在上传: ${fileName} (<span id="upload-size">0</span>/${formatSize(fileSize)})`;
+            statusDiv.innerHTML = `📤 正在上传: ${fileName} (<span id="upload-size-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}">0</span>/${formatSize(fileSize)})`;
             messagesDiv.appendChild(statusDiv);
             
-            // 添加进度条容器
             const progressContainer = document.createElement('div');
             progressContainer.className = 'progress-container';
             const progressBar = document.createElement('div');
@@ -276,16 +302,17 @@ PHONE_PAGE = """
             const xhr = new XMLHttpRequest();
             xhr.open('POST', '/upload', true);
             
-            // 上传进度事件
+            const sizeId = `upload-size-${fileName.replace(/[^a-zA-Z0-9]/g, '_')}`;
+            
             xhr.upload.addEventListener('progress', function(e) {
                 if (e.lengthComputable) {
                     const percent = Math.round((e.loaded / e.total) * 100);
                     progressBar.style.width = percent + '%';
-                    document.getElementById('upload-size').textContent = formatSize(e.loaded);
+                    const sizeEl = document.getElementById(sizeId);
+                    if (sizeEl) sizeEl.textContent = formatSize(e.loaded);
                 }
             });
             
-            // 上传完成
             xhr.addEventListener('load', function() {
                 if (xhr.status === 200) {
                     try {
@@ -294,33 +321,36 @@ PHONE_PAGE = """
                             socket.emit('file_uploaded', { file_id: data.file_id, filename: data.filename });
                             progressBar.style.backgroundColor = '#00b894';
                             statusDiv.innerHTML = `✅ 上传成功: ${fileName}`;
+                            if (callback) callback(true);
                         } else {
                             statusDiv.innerHTML = `❌ 上传失败: ${data.msg || '未知错误'}`;
                             progressBar.style.backgroundColor = '#e74c3c';
+                            if (callback) callback(false);
                         }
                     } catch (err) {
                         statusDiv.innerHTML = '❌ 上传失败: 解析响应失败';
                         progressBar.style.backgroundColor = '#e74c3c';
+                        if (callback) callback(false);
                     }
                 } else {
                     statusDiv.innerHTML = `❌ 上传失败: HTTP ${xhr.status}`;
                     progressBar.style.backgroundColor = '#e74c3c';
+                    if (callback) callback(false);
                 }
             });
             
-            // 上传失败
             xhr.addEventListener('error', function() {
                 statusDiv.innerHTML = '❌ 上传失败: 网络错误';
                 progressBar.style.backgroundColor = '#e74c3c';
+                if (callback) callback(false);
             });
             
-            // 上传取消
             xhr.addEventListener('abort', function() {
                 statusDiv.innerHTML = '⏹️ 上传已取消';
+                if (callback) callback(false);
             });
             
             xhr.send(formData);
-            document.getElementById('fileInput').value = '';
         }
         
         function formatSize(bytes) {
@@ -652,9 +682,24 @@ class LanChatWindow(QMainWindow):
         self.send_text_btn = QPushButton("发送")
         self.send_file_btn = QPushButton("📎 文件")
         self.send_file_btn.setObjectName("sendFileBtn")
+        self.send_folder_btn = QPushButton("📁 文件夹")
+        self.send_folder_btn.setObjectName("sendFolderBtn")
+        self.send_folder_btn.setStyleSheet("""
+            QPushButton#sendFolderBtn {
+                background-color: #fdcb6e;
+                color: #2d3436;
+            }
+            QPushButton#sendFolderBtn:hover {
+                background-color: #f9ca24;
+            }
+            QPushButton#sendFolderBtn:pressed {
+                background-color: #e1b621;
+            }
+        """)
         self.input_layout.addWidget(self.text_input)
         self.input_layout.addWidget(self.send_text_btn)
         self.input_layout.addWidget(self.send_file_btn)
+        self.input_layout.addWidget(self.send_folder_btn)
 
         # 添加到主布局
         self.main_layout.addLayout(title_layout)
@@ -668,6 +713,7 @@ class LanChatWindow(QMainWindow):
         # 连接信号
         self.send_text_btn.clicked.connect(self.send_text)
         self.send_file_btn.clicked.connect(self.send_file)
+        self.send_folder_btn.clicked.connect(self.send_folder)
         self.text_input.installEventFilter(self)  # 处理回车发送
 
         # 连接信号发射器
@@ -1005,11 +1051,11 @@ class LanChatWindow(QMainWindow):
             traceback.print_exc()
 
     def send_file(self):
-        """选择文件并生成下载链接推送给手机"""
+        """选择多个文件并生成下载链接推送给手机"""
         print(f"\n=== send_file 方法调用 ===")
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择要发送的文件")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件（可多选）")
         
-        if not file_path:
+        if not file_paths:
             print("✗ 未选择文件")
             return
         
@@ -1020,29 +1066,103 @@ class LanChatWindow(QMainWindow):
             print("✗ 手机未连接")
             return
         
-        filename = os.path.basename(file_path)
-        print(f"选择的文件: {filename}")
+        file_count = len(file_paths)
+        self.add_message(f"📎 正在发送 {file_count} 个文件...", 'pc')
         
-        # 生成唯一 ID
-        file_id = str(uuid.uuid4())[:8]
-        temp_downloads[file_id] = (filename, file_path)
-        download_url = f"http://{get_lan_ip()}:5000/download/{file_id}"
-        self.add_message(f"📎 已发送文件: {filename} (点击链接下载)", 'pc')
+        success_count = 0
+        for file_path in file_paths:
+            filename = os.path.basename(file_path)
+            print(f"选择的文件: {filename}")
+            
+            file_id = str(uuid.uuid4())[:8]
+            temp_downloads[file_id] = (filename, file_path)
+            download_url = f"http://{get_lan_ip()}:5000/download/{file_id}"
+            
+            try:
+                print("尝试使用 server.emit 发送文件链接...")
+                socketio.server.emit('file_download', {'url': download_url, 'filename': filename}, room=phone_sid)
+                print(f"✓ 文件链接发送成功到 room: {phone_sid}")
+                success_count += 1
+            except Exception as e:
+                self.add_message(f"发送文件失败 {filename}: {e}", 'system')
+                print(f"✗ server.emit 发送失败: {e}")
+                import traceback
+                traceback.print_exc()
         
-        # 使用 server.emit 直接发送
+        self.add_message(f"✅ 已发送 {success_count}/{file_count} 个文件", 'pc')
+
+    def send_folder(self):
+        """选择文件夹并压缩后发送给手机"""
+        print(f"\n=== send_folder 方法调用 ===")
+        folder_path = QFileDialog.getExistingDirectory(self, "选择要发送的文件夹")
+        
+        if not folder_path:
+            print("✗ 未选择文件夹")
+            return
+        
+        # 检查手机是否连接
+        print(f"phone_sid = {phone_sid}")
+        if not phone_sid:
+            self.add_message("手机未连接，无法发送文件夹", 'system')
+            print("✗ 手机未连接")
+            return
+        
+        folder_name = os.path.basename(folder_path)
+        print(f"选择的文件夹: {folder_name}")
+        
+        self.add_message(f"📁 正在压缩文件夹: {folder_name}...", 'pc')
+        
         try:
-            print("尝试使用 server.emit 发送文件链接...")
-            socketio.server.emit('file_download', {'url': download_url, 'filename': filename}, room=phone_sid)
-            print(f"✓ 文件链接发送成功到 room: {phone_sid}")
+            temp_dir = tempfile.gettempdir()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_filename = f"{folder_name}_{timestamp}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+            
+            file_count = 0
+            total_size = 0
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(folder_path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, folder_path)
+                        zipf.write(file_path, arcname)
+                        file_count += 1
+                        total_size += os.path.getsize(file_path)
+            
+            _temp_zip_files.add(zip_path)
+            
+            zip_size = os.path.getsize(zip_path)
+            size_str = self.format_size(zip_size)
+            
+            self.add_message(f"📦 压缩完成: {file_count} 个文件, 大小: {size_str}", 'pc')
+            
+            file_id = str(uuid.uuid4())[:8]
+            temp_downloads[file_id] = (zip_filename, zip_path)
+            download_url = f"http://{get_lan_ip()}:5000/download/{file_id}"
+            
+            socketio.server.emit('file_download', {'url': download_url, 'filename': zip_filename}, room=phone_sid)
+            self.add_message(f"📎 已发送文件夹: {folder_name}.zip ({size_str})", 'pc')
+            print(f"✓ 文件夹压缩包发送成功")
+            
         except Exception as e:
-            self.add_message(f"发送文件失败: {e}", 'system')
-            print(f"✗ server.emit 发送失败: {e}")
+            self.add_message(f"发送文件夹失败: {e}", 'system')
+            print(f"✗ 发送文件夹失败: {e}")
             import traceback
             traceback.print_exc()
 
+    def format_size(self, bytes_size):
+        """格式化文件大小"""
+        if bytes_size == 0:
+            return "0 B"
+        k = 1024
+        sizes = ['B', 'KB', 'MB', 'GB']
+        i = int((len(str(bytes_size)) - 1) // 3)
+        i = min(i, len(sizes) - 1)
+        return f"{bytes_size / (k ** i):.2f} {sizes[i]}"
+
     def closeEvent(self, event):
-        """窗口关闭时停止 Flask 服务"""
-        # 停止 socketio 服务器（通过子线程）
+        """窗口关闭时停止 Flask 服务并清理临时文件"""
+        cleanup_temp_files()
         os._exit(0)  # 简易退出，实际项目中可以优雅关闭
 
 # ------------------- 工具函数 -------------------
@@ -1098,6 +1218,22 @@ def get_lan_ip():
 # ------------------- 启动服务 -------------------
 def start_flask():
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+# ------------------- 临时文件清理 -------------------
+def cleanup_temp_files():
+    """清理所有临时压缩包文件"""
+    global _temp_zip_files
+    files_to_remove = list(_temp_zip_files)
+    for path in files_to_remove:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"已清理临时文件: {path}")
+        except Exception as e:
+            print(f"清理临时文件失败 {path}: {e}")
+    _temp_zip_files.clear()
+
+atexit.register(cleanup_temp_files)
 
 if __name__ == '__main__':
     # 解析命令行参数
