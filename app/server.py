@@ -28,7 +28,7 @@ socketio = SocketIO(app, async_mode='gevent')
 
 temp_downloads = {}
 phone_uploads = {}
-phone_sid = None
+phone_sids = set()
 _temp_zip_files = set()
 
 PHONE_PAGE = """
@@ -383,26 +383,33 @@ def get_file(file_id):
 
 @socketio.on('connect')
 def handle_connect():
-    global phone_sid
     from flask import request
-    phone_sid = request.sid
-    print('手机已连接, sid:', phone_sid)
+    sid = request.sid
+    phone_sids.add(sid)
+    print('手机已连接, sid:', sid)
     signal_emitter.phone_connected.emit(True)
-    signal_emitter.phone_sid_updated.emit(phone_sid)
+    signal_emitter.phone_sid_updated.emit(sid)
+    signal_emitter.device_connected.emit(sid, 'phone', f'手机-{sid[:4]}')
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    global phone_sid
-    print('手机断开连接, sid:', phone_sid)
-    phone_sid = None
-    signal_emitter.phone_connected.emit(False)
-    signal_emitter.phone_sid_updated.emit(None)
+    from flask import request
+    sid = request.sid
+    phone_sids.discard(sid)
+    print('手机断开连接, sid:', sid)
+    if not phone_sids:
+        signal_emitter.phone_connected.emit(False)
+        signal_emitter.phone_sid_updated.emit(None)
+    signal_emitter.device_disconnected.emit(sid)
 
 @socketio.on('text_message')
 def handle_text_message(data):
+    from flask import request
     msg = data.get('message', '')
-    print(f"收到手机文本: {msg}")
-    signal_emitter.received_text.emit(msg, 'phone')
+    source_msg = f"[{request.sid[:4]}] {msg}"
+    print(f"收到手机文本: {source_msg}")
+    signal_emitter.phone_text_sid.emit(request.sid)
+    signal_emitter.received_text.emit(source_msg, 'phone')
 
 @socketio.on('upload_complete')
 def handle_upload_complete(data):
@@ -411,10 +418,12 @@ def handle_upload_complete(data):
 
 @socketio.on('file_uploaded')
 def handle_file_uploaded(data):
+    from flask import request
     file_id = data.get('file_id')
     filename = data.get('filename')
-    print(f"手机上传文件完成: {filename}")
-    signal_emitter.received_file.emit(file_id, filename)
+    source_sid = request.sid
+    print(f"手机上传文件完成: {filename} (来源: {source_sid[:4]})")
+    signal_emitter.received_file.emit(file_id, filename, source_sid)
 
 def cleanup_temp_files():
     files_to_remove = list(_temp_zip_files)
