@@ -799,10 +799,13 @@ class LanChatWindow(QMainWindow):
                     self._render_chat_history()
 
         elif source == 'system':
-            # 系统消息 —— 存入当前聊天对象（如果有）
+            # 系统消息 —— 存入当前聊天对象（如果有）；否则存入所有设备
             if self.current_chat_key:
                 self._append_to_history(self.current_chat_key, content, source, is_file, now_str)
                 self._render_chat_history()
+            else:
+                for key in self.devices:
+                    self._append_to_history(key, content, source, is_file, now_str)
 
     def _append_to_history(self, key, content, source, is_file, timestamp):
         """向指定设备的聊天历史追加一条消息"""
@@ -1084,6 +1087,7 @@ class LanChatWindow(QMainWindow):
     # ================================================================
 
     def handle_received_file(self, file_id, filename, source_sid=None):
+        print(f"收到文件通知: file_id={file_id}, filename={filename}")
         self.add_message(f"收到文件: {filename}", 'system')
         import threading
         threading.Thread(target=self.download_and_open_file, args=(file_id, filename), daemon=True).start()
@@ -1092,9 +1096,17 @@ class LanChatWindow(QMainWindow):
         try:
             import requests
             download_url = f"http://127.0.0.1:5000/get_file/{file_id}"
-            save_path = os.path.join(self.DOWNLOAD_FOLDER, filename)
+            # 确保中间目录存在（文件名可能包含路径，如 "文件夹/文件.txt"）
+            safe_filename = filename.replace('\\', '/')
+            save_path = os.path.join(self.DOWNLOAD_FOLDER, safe_filename)
+            save_dir = os.path.dirname(save_path)
+            if save_dir and not os.path.exists(save_dir):
+                os.makedirs(save_dir, exist_ok=True)
+
+            print(f"开始下载文件: {download_url} → {save_path}")
 
             if os.path.exists(save_path):
+                print(f"文件已存在: {save_path}")
                 signal_emitter.received_text.emit(f"文件已存在: {filename}", 'system')
                 return
 
@@ -1102,11 +1114,14 @@ class LanChatWindow(QMainWindow):
             if response.status_code == 200:
                 with open(save_path, 'wb') as f:
                     f.write(response.content)
+                print(f"文件下载成功: {save_path} ({len(response.content)} 字节)")
                 signal_emitter.received_text.emit(f"已下载: {filename}", 'system')
             else:
+                print(f"下载失败: HTTP {response.status_code}")
                 signal_emitter.received_text.emit(
                     f"下载失败: {filename} (HTTP {response.status_code})", 'system')
         except Exception as e:
+            print(f"下载文件出错: {e}")
             signal_emitter.received_text.emit(f"下载文件出错: {str(e)}", 'system')
 
     # ================================================================
