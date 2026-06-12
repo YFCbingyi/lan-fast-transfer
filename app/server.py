@@ -29,6 +29,7 @@ socketio = SocketIO(app, async_mode='gevent')
 temp_downloads = {}
 phone_uploads = {}
 phone_sids = set()
+pc_sids = {}  # sid -> device_name（PC 客户端）
 _temp_zip_files = set()
 
 PHONE_PAGE = """
@@ -148,6 +149,7 @@ PHONE_PAGE = """
         const messagesDiv = document.getElementById('messages');
 
         socket.on('connect', () => {
+            socket.emit('identify', {type: 'phone'});
             addStatus('已连接到电脑');
         });
 
@@ -386,30 +388,68 @@ def handle_connect():
     from flask import request
     sid = request.sid
     phone_sids.add(sid)
-    print('手机已连接, sid:', sid)
-    signal_emitter.phone_connected.emit(True)
-    signal_emitter.phone_sid_updated.emit(sid)
-    signal_emitter.device_connected.emit(sid, 'phone', f'手机-{sid[:4]}')
+    print('新连接, sid:', sid)
 
 @socketio.on('disconnect')
 def handle_disconnect():
     from flask import request
     sid = request.sid
+
+    # 从 phone_sids 移除
     phone_sids.discard(sid)
-    print('手机断开连接, sid:', sid)
-    if not phone_sids:
-        signal_emitter.phone_connected.emit(False)
-        signal_emitter.phone_sid_updated.emit(None)
-    signal_emitter.device_disconnected.emit(sid)
+    # 从 pc_sids 移除
+    pc_name = pc_sids.pop(sid, None)
+
+    if pc_name:
+        print(f'PC 断开连接: {pc_name} (sid: {sid[:4]})')
+        signal_emitter.device_disconnected.emit(sid)
+    else:
+        print(f'手机断开连接, sid: {sid[:4]}')
+        if not phone_sids:
+            signal_emitter.phone_connected.emit(False)
+            signal_emitter.phone_sid_updated.emit(None)
+        signal_emitter.device_disconnected.emit(sid)
+
+@socketio.on('identify')
+def handle_identify(data):
+    """客户端身份识别：区分手机 / PC 客户端"""
+    from flask import request
+    sid = request.sid
+    client_type = data.get('type', '')
+    client_name = data.get('name', 'Unknown')
+
+    if client_type == 'pc':
+        # 从 phone_sids 移入 pc_sids
+        phone_sids.discard(sid)
+        pc_sids[sid] = client_name
+        display_name = f"🖥️ {client_name}"
+        print(f'PC 客户端已识别: {client_name} (sid: {sid[:4]})')
+        signal_emitter.device_connected.emit(sid, 'pc', display_name)
+    else:
+        # 手机客户端（默认已加入 phone_sids）
+        print(f'手机客户端已识别: {sid[:4]}')
+        signal_emitter.phone_connected.emit(True)
+        signal_emitter.phone_sid_updated.emit(sid)
+        signal_emitter.device_connected.emit(sid, 'phone', f'手机-{sid[:4]}')
 
 @socketio.on('text_message')
 def handle_text_message(data):
     from flask import request
     msg = data.get('message', '')
-    source_msg = f"[{request.sid[:4]}] {msg}"
-    print(f"收到手机文本: {source_msg}")
-    signal_emitter.phone_text_sid.emit(request.sid)
-    signal_emitter.received_text.emit(source_msg, 'phone')
+    sid = request.sid
+
+    if sid in pc_sids:
+        # 来自 PC 客户端
+        pc_name = pc_sids[sid]
+        source_msg = f"[{pc_name}] {msg}"
+        print(f"收到 PC 文本: {source_msg}")
+        signal_emitter.received_text.emit(source_msg, 'remote_pc')
+    else:
+        # 来自手机
+        source_msg = f"[{sid[:4]}] {msg}"
+        print(f"收到手机文本: {source_msg}")
+        signal_emitter.phone_text_sid.emit(sid)
+        signal_emitter.received_text.emit(source_msg, 'phone')
 
 @socketio.on('upload_complete')
 def handle_upload_complete(data):
@@ -422,8 +462,16 @@ def handle_file_uploaded(data):
     file_id = data.get('file_id')
     filename = data.get('filename')
     source_sid = request.sid
-    print(f"手机上传文件完成: {filename} (来源: {source_sid[:4]})")
-    signal_emitter.received_file.emit(file_id, filename, source_sid)
+
+    if source_sid in pc_sids:
+        # 来自 PC 客户端
+        pc_name = pc_sids[source_sid]
+        print(f"PC 发送文件完成: {filename} (来自: {pc_name})")
+        signal_emitter.received_file.emit(file_id, filename, 'pc')
+    else:
+        # 来自手机
+        print(f"手机上传文件完成: {filename} (来源: {source_sid[:4]})")
+        signal_emitter.received_file.emit(file_id, filename, source_sid)
 
 def cleanup_temp_files():
     files_to_remove = list(_temp_zip_files)

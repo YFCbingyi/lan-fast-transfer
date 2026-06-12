@@ -19,7 +19,7 @@ from io import BytesIO
 
 from app.signal import signal_emitter
 from app.config import save_config, DEFAULT_DOWNLOAD_FOLDER
-from app.utils import get_lan_ip, format_size
+from app.utils import get_lan_ips, format_size
 from app.server import temp_downloads, _temp_zip_files, socketio, phone_sids
 from app.discovery import DeviceDiscovery
 from app.pc_client import PCClient
@@ -148,9 +148,9 @@ class LanChatWindow(QMainWindow):
         signal_emitter.device_disconnected.connect(self._on_device_disconnected)
 
         # 设备发现
-        lan_ip = get_lan_ip()
+        self.lan_ip = self._choose_lan_ip()
         hostname = socket.gethostname()
-        self.discovery = DeviceDiscovery(hostname, lan_ip)
+        self.discovery = DeviceDiscovery(hostname, self.lan_ip)
         self.discovery.device_found.connect(self._on_pc_device_found)
         self.discovery.device_lost.connect(self._on_pc_device_lost)
         self.discovery.start()
@@ -158,6 +158,47 @@ class LanChatWindow(QMainWindow):
         self.update_qr_and_ip()
         self._show_placeholder()
         self.text_input.setFocus()
+
+    def _choose_lan_ip(self):
+        """弹出 IP 选择对话框，让用户选择使用的局域网 IP。"""
+        ips = get_lan_ips()
+        if len(ips) == 1:
+            print(f"使用局域网 IP: {ips[0]}")
+            return ips[0]
+
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QRadioButton,
+                                     QButtonGroup, QDialogButtonBox, QLabel)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择局域网 IP")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("检测到多个局域网 IP，请选择要使用的地址："))
+
+        group = QButtonGroup(dialog)
+        for i, ip in enumerate(ips):
+            btn = QRadioButton(f"  {ip}")
+            if i == 0:
+                btn.setChecked(True)
+            group.addButton(btn, i)
+            layout.addWidget(btn)
+
+        layout.addSpacing(10)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() == QDialog.Accepted:
+            selected = ips[group.checkedId()]
+        else:
+            selected = ips[0]  # 取消则用第一个
+
+        print(f"用户选择 IP: {selected}")
+        return selected
 
     # ================================================================
     # UI 构建
@@ -478,6 +519,8 @@ class LanChatWindow(QMainWindow):
 
     def _on_device_connected(self, sid, device_type, display_name):
         """手机设备连接"""
+        if device_type == 'pc':
+            return  # PC 设备由 UDP 发现管理，避免重复
         self._add_device_to_list(sid, device_type, display_name, sid=sid)
         self._update_phone_status()
 
@@ -552,6 +595,36 @@ class LanChatWindow(QMainWindow):
             self.add_message(f"连接 PC 失败: {e}", 'system')
             self.pc_client = None
 
+    def _ensure_pc_connection(self, device_info):
+        """确保已连接到指定 PC 设备，未连接则自动尝试连接。返回 True/False。"""
+        target_ip = device_info['ip']
+        target_port = device_info.get('port', 5000)
+
+        if self.pc_client and self.pc_client._connected and self.pc_client.target_ip == target_ip:
+            return True
+
+        if self.pc_client:
+            try:
+                self.pc_client.disconnect()
+            except Exception:
+                pass
+            self.pc_client = None
+
+        # 建立新连接
+        self.pc_client = PCClient(target_ip, target_port)
+        self.pc_client.connected.connect(self._on_pc_connected)
+        self.pc_client.disconnected.connect(self._on_pc_disconnected)
+        self.pc_client.text_received.connect(self._on_pc_text_received)
+        self.pc_client.file_received.connect(self._on_pc_file_received)
+
+        try:
+            self.pc_client.connect()
+            return True
+        except Exception as e:
+            self.add_message(f"连接 PC {device_info.get('device_name', target_ip)} 失败: {e}", 'system')
+            self.pc_client = None
+            return False
+
     def _switch_chat(self, key):
         """切换到指定设备的聊天视图"""
         self.current_chat_key = key
@@ -624,6 +697,13 @@ class LanChatWindow(QMainWindow):
             border_radius = "10px 10px 0 10px"
             align = "right"
             link_color = "white"
+        elif source == 'remote_pc':
+            # 远程 PC 消息 —— 左对齐，浅灰绿
+            text_color = "#2d3436"
+            bg_color = "#e8f5e9"
+            border_radius = "10px 10px 10px 0"
+            align = "left"
+            link_color = "#0984e3"
         else:
             # 手机消息 —— 左对齐，浅灰
             text_color = "#2d3436"
@@ -652,12 +732,24 @@ class LanChatWindow(QMainWindow):
         """记录最近收到手机消息的来源 SID"""
         self._last_phone_sid = sid
 
+    def _find_pc_device_key(self, content):
+        """从远程 PC 消息内容 [PC_Name] 中提取 PC 名，返回对应的设备 key（IP）"""
+        import re
+        m = re.match(r'^\[(.+?)\]\s', content)
+        if not m:
+            return None
+        pc_name = m.group(1)
+        for key, info in self.devices.items():
+            if info['type'] == 'pc' and info.get('device_name') == pc_name:
+                return key
+        return None
+
     def add_message(self, content, source, is_file=False):
         """
         添加消息到聊天历史。
 
         扩展自原始签名 (self, content, source)，增加 is_file 参数。
-        source 取值：'pc'（本机发送）、'phone'（手机收到）、'system'（系统消息）
+        source 取值：'pc'（本机发送）、'remote_pc'（远程 PC 收到）、'phone'（手机收到）、'system'（系统消息）
         is_file=True 时以文件气泡样式渲染。
         """
         now_str = datetime.now().strftime("%H:%M")
@@ -671,6 +763,19 @@ class LanChatWindow(QMainWindow):
                 # 未选设备时仍记录但暂不显示
                 if self.current_chat_key:
                     self._append_to_history(self.current_chat_key, content, source, is_file, now_str)
+
+        elif source == 'remote_pc':
+            # 远程 PC 发来的消息 —— 从内容中提取 PC 名，存入对应 PC 设备的历史
+            target_key = self._find_pc_device_key(content)
+            if target_key:
+                self._append_to_history(target_key, content, source, is_file, now_str)
+                if self.current_chat_key == target_key:
+                    self._render_chat_history()
+            else:
+                # 找不到目标 PC 时回退到当前聊天对象
+                if self.current_chat_key:
+                    self._append_to_history(self.current_chat_key, content, source, is_file, now_str)
+                    self._render_chat_history()
 
         elif source == 'phone':
             # 来自手机的消息 —— 只存入来源手机的历史
@@ -746,7 +851,7 @@ class LanChatWindow(QMainWindow):
         self._update_phone_status()
 
     def _on_pc_text_received(self, msg, sender):
-        self.add_message(msg, 'phone')
+        self.add_message(msg, 'remote_pc')
 
     def _on_pc_file_received(self, file_id, filename):
         self.handle_received_file(file_id, filename, source_sid='pc')
@@ -767,7 +872,7 @@ class LanChatWindow(QMainWindow):
     # ================================================================
 
     def update_qr_and_ip(self):
-        lan_ip = get_lan_ip()
+        lan_ip = self.lan_ip
         port = 5000
         server_url = f"http://{lan_ip}:{port}"
         self.ip_label.setText(f"服务器地址: {server_url}")
@@ -1054,14 +1159,14 @@ class LanChatWindow(QMainWindow):
                     self.add_message(f"发送到手机失败: {e}", 'system')
 
             elif device['type'] == 'pc':
-                if self.pc_client and self.pc_client._connected \
-                        and self.pc_client.target_ip == device.get('ip', ''):
-                    try:
-                        self.pc_client.send_text(text)
-                    except Exception as e:
-                        self.add_message(f"发送到 PC 失败: {e}", 'system')
-                else:
-                    self.add_message(f"PC {device['display_name']} 未连接，跳过", 'system')
+                if not (self.pc_client and self.pc_client._connected
+                        and self.pc_client.target_ip == device.get('ip', '')):
+                    if not self._ensure_pc_connection(device):
+                        continue
+                try:
+                    self.pc_client.send_text(text)
+                except Exception as e:
+                    self.add_message(f"发送到 PC 失败: {e}", 'system')
 
     # ================================================================
     # 发送文件 / 文件夹（带设备选择器）
@@ -1118,7 +1223,7 @@ class LanChatWindow(QMainWindow):
             filename = os.path.basename(file_path)
             file_id = str(uuid.uuid4())[:8]
             temp_downloads[file_id] = (filename, file_path)
-            download_url = f"http://{get_lan_ip()}:5000/download/{file_id}"
+            download_url = f"http://{self.lan_ip}:5000/download/{file_id}"
 
             sent_any = False
 
@@ -1140,16 +1245,16 @@ class LanChatWindow(QMainWindow):
                         self.add_message(f"发送文件到手机失败 {filename}: {e}", 'system')
 
                 elif device['type'] == 'pc':
-                    # 发送到 PC（仅当该 PC 已连接）
-                    if self.pc_client and self.pc_client._connected \
-                            and self.pc_client.target_ip == device.get('ip', ''):
-                        try:
-                            self.pc_client.send_file(file_path)
-                            sent_any = True
-                        except Exception as e:
-                            self.add_message(f"发送文件到 PC 失败 {filename}: {e}", 'system')
-                    else:
-                        self.add_message(f"PC {device['display_name']} 未连接，跳过", 'system')
+                    # 发送到 PC（自动连接）
+                    if not (self.pc_client and self.pc_client._connected
+                            and self.pc_client.target_ip == device.get('ip', '')):
+                        if not self._ensure_pc_connection(device):
+                            continue
+                    try:
+                        self.pc_client.send_file(file_path)
+                        sent_any = True
+                    except Exception as e:
+                        self.add_message(f"发送文件到 PC 失败 {filename}: {e}", 'system')
 
             if sent_any:
                 success_count += 1
@@ -1188,7 +1293,7 @@ class LanChatWindow(QMainWindow):
 
             file_id = str(uuid.uuid4())[:8]
             temp_downloads[file_id] = (zip_filename, zip_path)
-            download_url = f"http://{get_lan_ip()}:5000/download/{file_id}"
+            download_url = f"http://{self.lan_ip}:5000/download/{file_id}"
 
             sent_any = False
 
@@ -1209,19 +1314,20 @@ class LanChatWindow(QMainWindow):
                         self.add_message(f"发送文件夹到手机失败: {e}", 'system')
 
                 elif device['type'] == 'pc':
-                    if self.pc_client and self.pc_client._connected \
-                            and self.pc_client.target_ip == device.get('ip', ''):
-                        try:
-                            self.pc_client.send_file(zip_path)
-                            sent_any = True
-                        except Exception as e:
-                            self.add_message(f"发送文件夹到 PC 失败: {e}", 'system')
-                    else:
-                        self.add_message(f"PC {device['display_name']} 未连接，跳过", 'system')
+                    if not (self.pc_client and self.pc_client._connected
+                            and self.pc_client.target_ip == device.get('ip', '')):
+                        if not self._ensure_pc_connection(device):
+                            continue
+                    try:
+                        self.pc_client.send_file(zip_path)
+                        sent_any = True
+                    except Exception as e:
+                        self.add_message(f"发送文件夹到 PC 失败: {e}", 'system')
 
             if sent_any:
                 self.add_message(f"📎 已发送文件夹: {folder_name}.zip ({size_str})", 'pc', is_file=True)
-
+            else:
+                self.add_message("❌ 文件夹发送失败", 'pc')
         except Exception as e:
             self.add_message(f"发送文件夹失败: {e}", 'system')
 

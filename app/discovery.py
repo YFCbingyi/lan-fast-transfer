@@ -39,15 +39,23 @@ class DeviceDiscovery(QObject):
         }
 
     def _broadcast_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(1)
+        # 发送套接字：绑定到具体 IP，确保广播从该 IP 对应的物理网卡发出
+        send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            send_sock.bind((self._own_ip, 0))
+        except Exception as e:
+            print(f"绑定发送套接字失败: {e}")
+            send_sock.close()
+            return
+        send_sock.settimeout(1)
 
         while not self._stop_event.is_set():
             try:
                 data = self._get_broadcast_data()
                 message = json.dumps(data).encode('utf-8')
-                sock.sendto(message, ('255.255.255.255', self.BROADCAST_PORT))
+                send_sock.sendto(message, ('255.255.255.255', self.BROADCAST_PORT))
             except Exception as e:
                 print(f"广播发送失败: {e}")
 
@@ -55,22 +63,22 @@ class DeviceDiscovery(QObject):
                 if self._stop_event.wait(1):
                     break
 
-        sock.close()
+        send_sock.close()
 
     def _listen_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(1)
+        recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        recv_sock.settimeout(1)
 
         try:
-            sock.bind(('0.0.0.0', self.BROADCAST_PORT))
+            recv_sock.bind(('0.0.0.0', self.BROADCAST_PORT))
         except Exception as e:
             print(f"绑定监听端口失败: {e}")
             return
 
         while not self._stop_event.is_set():
             try:
-                data, addr = sock.recvfrom(4096)
+                data, addr = recv_sock.recvfrom(4096)
                 message = json.loads(data.decode('utf-8'))
 
                 device_ip = message.get('ip', addr[0])
@@ -105,7 +113,7 @@ class DeviceDiscovery(QObject):
             except Exception as e:
                 print(f"监听接收失败: {e}")
 
-        sock.close()
+        recv_sock.close()
 
     def _timeout_check_loop(self):
         while not self._stop_event.is_set():
