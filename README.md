@@ -55,11 +55,10 @@ python main.py --download-path D:/Downloads
 
 ## 📁 文件结构
 
+```bash
 main.py              # 程序入口
 config.json          # 配置文件（自动生成）
 requirements.txt     # 依赖清单
-LanFastTransfer.spec # PyInstaller 打包配置
-
 app/                 # 核心模块
 ├── __init__.py
 ├── server.py        # Flask 服务器 + SocketIO + 手机端网页
@@ -72,6 +71,9 @@ app/                 # 核心模块
     ├── __init__.py
     ├── main_window.py       # 主窗口界面
     └── device_selector.py   # 设备选择对话框
+```
+
+
 
 ## 🛠️ 技术栈
 
