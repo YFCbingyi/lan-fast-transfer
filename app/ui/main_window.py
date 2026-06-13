@@ -62,22 +62,6 @@ class LanChatWindow(QMainWindow):
             QPushButton:pressed {
                 background-color: #4a3db5;
             }
-            QPushButton#sendFileBtn {
-                background-color: #00b894;
-            }
-            QPushButton#sendFileBtn:hover {
-                background-color: #00a381;
-            }
-            QPushButton#sendFolderBtn {
-                background-color: #fdcb6e;
-                color: #2d3436;
-            }
-            QPushButton#sendFolderBtn:hover {
-                background-color: #f9ca24;
-            }
-            QPushButton#sendFolderBtn:pressed {
-                background-color: #e1b621;
-            }
             QTextEdit {
                 border: 1px solid #dfe6e9;
                 border-radius: 15px;
@@ -110,7 +94,7 @@ class LanChatWindow(QMainWindow):
         self.splitter.setHandleWidth(2)
         self.splitter.setStyleSheet("""
             QSplitter::handle {
-                background-color: #dfe6e9;
+                background-color: #b2bec3;
             }
         """)
 
@@ -130,6 +114,18 @@ class LanChatWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.splitter)
+
+        # ---- 底部页脚 ----
+        footer_label = QLabel(
+            '<div style="text-align: center; color: #888888; font-size: 10px; padding: 1px 0;">'
+            '原平沐阳网络 · 开源实验室'
+            '<span style="margin: 0 4px;">|</span>'
+            '更多效率工具关注公众号：<span style="font-weight: bold;">「沐阳网络干货」</span>'
+            '</div>'
+        )
+        footer_label.setFixedHeight(22)
+        footer_label.setStyleSheet("background-color: #ffffff; border-top: 1px solid #dfe6e9;")
+        main_layout.addWidget(footer_label)
 
         # ============================================================
         # 信号连接
@@ -243,6 +239,12 @@ class LanChatWindow(QMainWindow):
         title_row.addWidget(about_btn)
         layout.addLayout(title_row)
 
+        # 分隔线
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        sep1.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
+        layout.addWidget(sep1)
+
         # ---- 折叠服务器信息 ----
         self._server_info_visible = False
         self.server_info_toggle = QPushButton("📡 服务器信息 ▸")
@@ -327,6 +329,12 @@ class LanChatWindow(QMainWindow):
 
         layout.addWidget(self.server_info_content)
 
+        # 分隔线
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
+        layout.addWidget(sep2)
+
         # ---- 设备列表 ----
         device_header = QLabel("📡 设备列表")
         device_header.setStyleSheet("color: #2d3436; font-weight: bold; font-size: 12px;")
@@ -337,7 +345,7 @@ class LanChatWindow(QMainWindow):
             QListWidget {
                 border: 1px solid #dfe6e9;
                 border-radius: 8px;
-                background-color: #f8f9fa;
+                background-color: #f0f1f3;
                 font-size: 12px;
                 padding: 4px;
             }
@@ -385,6 +393,12 @@ class LanChatWindow(QMainWindow):
         """)
         layout.addWidget(self.chat_header)
 
+        # 分隔线
+        sep_right1 = QFrame()
+        sep_right1.setFrameShape(QFrame.HLine)
+        sep_right1.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
+        layout.addWidget(sep_right1)
+
         # ---- 聊天消息显示区 ----
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
@@ -399,6 +413,12 @@ class LanChatWindow(QMainWindow):
             }
         """)
         layout.addWidget(self.chat_display, 1)
+
+        # 分隔线
+        sep_right2 = QFrame()
+        sep_right2.setFrameShape(QFrame.HLine)
+        sep_right2.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
+        layout.addWidget(sep_right2)
 
         # ---- 输入区域 ----
         input_container = QWidget()
@@ -420,22 +440,62 @@ class LanChatWindow(QMainWindow):
             }
         """)
 
-        btn_style = """
+        self.send_text_btn = QPushButton("发送")
+        self.send_text_btn.setStyleSheet("""
             QPushButton {
+                background-color: #6c5ce7;
+                color: white;
+                border: none;
                 border-radius: 12px;
                 padding: 8px 16px;
                 font-size: 13px;
                 font-weight: bold;
             }
-        """
-        self.send_text_btn = QPushButton("发送")
-        self.send_text_btn.setStyleSheet(btn_style)
+            QPushButton:hover {
+                background-color: #5a4bd1;
+            }
+            QPushButton:pressed {
+                background-color: #4a3db5;
+            }
+        """)
 
         self.send_file_btn = QPushButton("📎 文件")
-        self.send_file_btn.setObjectName("sendFileBtn")
+        self.send_file_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0984e3;
+                color: white;
+                border: none;
+                border-radius: 12px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0773c5;
+            }
+            QPushButton:pressed {
+                background-color: #0662a8;
+            }
+        """)
 
         self.send_folder_btn = QPushButton("📁 文件夹")
-        self.send_folder_btn.setObjectName("sendFolderBtn")
+        self.send_folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #fdcb6e;
+                color: #2d3436;
+                border: none;
+                border-radius: 12px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #f9ca24;
+            }
+            QPushButton:pressed {
+                background-color: #e1b621;
+            }
+        """)
 
         # 按钮尺寸
         for btn in (self.send_text_btn, self.send_file_btn, self.send_folder_btn):
