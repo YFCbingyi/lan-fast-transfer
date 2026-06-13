@@ -64,8 +64,6 @@ PHONE_PAGE = """
                  padding: 8px 15px; margin-left: 5px; font-size: 14px; cursor: pointer; }
         button:active { opacity: 0.8; }
         #fileInput { display: none; }
-        .file-btn { background: #00b894; }
-        .dir-btn { background: #fdcb6e; color: #2d3436; }
         .status { text-align: center; color: #777; font-size: 12px; padding: 5px; }
         .progress-container { width: 100%; background-color: #e0e0e0; border-radius: 5px; height: 8px; margin-top: 5px; }
         .progress-bar { height: 100%; background-color: #00b894; border-radius: 5px; transition: width 0.3s ease; }
@@ -81,6 +79,13 @@ PHONE_PAGE = """
         .disclaimer-box { background: #fff8e6; padding: 10px; border-radius: 8px; border-left: 3px solid #ffc107; }
         .about-close { width: 100%; padding: 12px; background: #6c5ce7; color: white; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; margin-top: 15px; position: sticky; bottom: 0; }
         .about-close:active { background: #5a4bd1; }
+        .input-area { position: relative; }
+        .popup-menu { display: none; position: absolute; bottom: 60px; right: 10px; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); overflow: hidden; z-index: 10; }
+        .popup-menu.show { display: block; }
+        .popup-item { padding: 12px 20px; font-size: 15px; cursor: pointer; white-space: nowrap; border: none; background: none; width: 100%; text-align: left; color: #2d3436; }
+        .popup-item:hover { background: #f5f5f5; }
+        .popup-item:first-child { border-bottom: 1px solid #eee; }
+        .popup-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 9; }
     </style>
 </head>
 <body>
@@ -94,9 +99,13 @@ PHONE_PAGE = """
         </div>
         <div class="input-area">
             <input type="text" id="textInput" placeholder="输入文字..." autocomplete="off">
-            <button onclick="sendText()">发送</button>
-            <button class="file-btn" onclick="document.getElementById('fileInput').click()">+</button>
-            <button class="dir-btn" onclick="document.getElementById('dirInput').click()">📁</button>
+            <button id="sendBtn" onclick="sendText()" style="display:none">发送</button>
+            <button id="plusBtn" onclick="togglePopup()">+</button>
+            <div class="popup-overlay" id="popupOverlay" onclick="hidePopup()"></div>
+            <div class="popup-menu" id="popupMenu">
+                <button class="popup-item" onclick="document.getElementById('fileInput').click();hidePopup()">📎 发送文件</button>
+                <button class="popup-item" onclick="document.getElementById('dirInput').click();hidePopup()">📁 发送文件夹</button>
+            </div>
             <input type="file" id="dirInput" webkitdirectory style="display:none" onchange="sendDirectory(this.files)">
             <input type="file" id="fileInput" onchange="sendFiles(this.files)" multiple>
         </div>
@@ -193,6 +202,7 @@ PHONE_PAGE = """
             socket.emit('text_message', { message: text });
             addMessage(text, 'local');
             input.value = '';
+            input.dispatchEvent(new Event('input'));
         }
 
         function sendFiles(files) {
@@ -325,9 +335,34 @@ PHONE_PAGE = """
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
+        document.getElementById('textInput').addEventListener('input', function() {
+            const sendBtn = document.getElementById('sendBtn');
+            const plusBtn = document.getElementById('plusBtn');
+            if (this.value.trim()) {
+                sendBtn.style.display = '';
+                plusBtn.style.display = 'none';
+            } else {
+                sendBtn.style.display = 'none';
+                plusBtn.style.display = '';
+            }
+        });
+        
         document.getElementById('textInput').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendText();
         });
+        
+        function togglePopup() {
+            const menu = document.getElementById('popupMenu');
+            const overlay = document.getElementById('popupOverlay');
+            const isShow = menu.classList.contains('show');
+            menu.classList.toggle('show');
+            overlay.style.display = isShow ? 'none' : 'block';
+        }
+        
+        function hidePopup() {
+            document.getElementById('popupMenu').classList.remove('show');
+            document.getElementById('popupOverlay').style.display = 'none';
+        }
         
         function showAbout() {
             document.getElementById('aboutModal').style.display = 'flex';
