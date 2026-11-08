@@ -1,10 +1,13 @@
 import os
 import socket
+import time
 import uuid
 
 import requests
 import socketio
 from PyQt5.QtCore import pyqtSignal, QObject
+
+CHUNK_SIZE = 4 * 1024 * 1024  # 4MB 分片，与服务端一致
 
 
 class PCClient(QObject):
@@ -97,12 +100,14 @@ class PCClient(QObject):
             raise ConnectionError("未连接到目标 PC")
         self.sio.emit('text_message', {'message': text})
 
-    def send_file(self, file_path):
-        """发送文件
+    def send_file(self, file_path, progress_cb=None):
+        """发送文件（分片上传协议，支持大文件与失败重试）
 
         流程：
-          1. HTTP POST /upload 上传文件到目标服务器
-          2. 通过 SocketIO 发送 file_uploaded 事件通知
+          1. POST /upload/init 创建上传会话，得到 upload_id
+          2. 逐片 POST /upload/chunk（单片失败重试 3 次）
+          3. POST /upload/finish 合并分片，得到 file_id
+          4. 通过 SocketIO 发送 file_uploaded 事件通知
         """
         if not self._connected or not self.sio:
             raise ConnectionError("未连接到目标 PC")
@@ -111,31 +116,72 @@ class PCClient(QObject):
             raise FileNotFoundError(f"文件不存在: {file_path}")
 
         filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        total_chunks = max(1, (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
-        # Step 1: HTTP 上传文件
-        with open(file_path, 'rb') as f:
-            resp = requests.post(
-                f"{self.base_url}/upload",
-                files={'file': (filename, f)},
-                timeout=60
-            )
-
+        # Step 1: 初始化上传会话
+        resp = requests.post(
+            f"{self.base_url}/upload/init",
+            json={'filename': filename, 'size': file_size, 'total': total_chunks},
+            timeout=15
+        )
         if resp.status_code != 200:
-            raise RuntimeError(f"文件上传失败: HTTP {resp.status_code}")
-
+            raise RuntimeError(f"初始化上传失败: HTTP {resp.status_code}")
         result = resp.json()
         if result.get('status') != 'ok':
-            raise RuntimeError(f"文件上传失败: {result.get('msg', '未知错误')}")
+            raise RuntimeError(f"初始化上传失败: {result.get('msg', '未知错误')}")
+        upload_id = result['upload_id']
+
+        # Step 2: 逐片上传
+        with open(file_path, 'rb') as f:
+            for index in range(total_chunks):
+                data = f.read(CHUNK_SIZE)
+                if not data:
+                    break
+                self._post_chunk(upload_id, index, data)
+                if progress_cb:
+                    progress_cb(min(file_size, (index + 1) * CHUNK_SIZE), file_size)
+
+        # Step 3: 合并分片
+        resp = requests.post(
+            f"{self.base_url}/upload/finish",
+            data={'upload_id': upload_id},
+            timeout=600
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"合并文件失败: HTTP {resp.status_code}")
+        result = resp.json()
+        if result.get('status') != 'ok':
+            raise RuntimeError(f"合并文件失败: {result.get('msg', '未知错误')}")
 
         file_id = result['file_id']
 
-        # Step 2: SocketIO 通知
+        # Step 4: SocketIO 通知
         self.sio.emit('file_uploaded', {
             'file_id': file_id,
             'filename': filename
         })
 
         return file_id
+
+    def _post_chunk(self, upload_id, index, data):
+        """上传单个分片，失败自动重试 3 次"""
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/upload/chunk",
+                    data={'upload_id': upload_id, 'index': index},
+                    files={'chunk': (str(index), data)},
+                    timeout=120
+                )
+                if resp.status_code == 200 and resp.json().get('status') == 'ok':
+                    return
+                last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:100]}")
+            except requests.RequestException as e:
+                last_error = e
+            time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError(f"分片 {index} 上传失败（已重试 3 次）: {last_error}")
 
     def disconnect(self):
         """断开连接"""

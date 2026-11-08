@@ -1170,11 +1170,14 @@ class LanChatWindow(QMainWindow):
                 signal_emitter.received_text.emit(f"文件已存在: {filename}", 'system')
                 return
 
-            response = requests.get(download_url, timeout=30)
+            # stream=True 分块写盘：恒定内存，大文件不再整体载入；timeout 放宽以适配大文件
+            response = requests.get(download_url, stream=True, timeout=(10, 300))
             if response.status_code == 200:
                 with open(save_path, 'wb') as f:
-                    f.write(response.content)
-                print(f"文件下载成功: {save_path} ({len(response.content)} 字节)")
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                print(f"文件下载成功: {save_path} ({os.path.getsize(save_path)} 字节)")
                 signal_emitter.received_text.emit(f"已下载: {filename}", 'system')
             else:
                 print(f"下载失败: HTTP {response.status_code}")
