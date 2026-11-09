@@ -1,21 +1,19 @@
 import os
+import time
 import uuid
 import atexit
 import shutil
 import hashlib
-import zipfile
-import tempfile
-from datetime import datetime
+import ipaddress
 from urllib.parse import quote
 
 import gevent
 from flask import Flask, request, send_from_directory, render_template_string, Response
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
 import engineio.async_drivers.gevent
 
 from app.config import load_config, DEFAULT_DOWNLOAD_FOLDER
 from app.signal import signal_emitter
-from app.utils import get_lan_ip
 
 config = load_config()
 
@@ -29,7 +27,9 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 
 app = Flask(__name__, static_folder=None)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['SECRET_KEY'] = 'secret!'
+app.config['SECRET_KEY'] = os.urandom(24).hex()
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 4MB 分片 + multipart 开销，防止无限写盘
+
 # 放宽心跳参数：手机浏览器切后台时页面被冻结无法及时回应 ping，
 # ping_timeout=60 可大幅减少"切后台即断开"的误判
 socketio = SocketIO(app, async_mode='gevent',
@@ -37,10 +37,27 @@ socketio = SocketIO(app, async_mode='gevent',
 
 temp_downloads = {}
 phone_uploads = {}
-phone_sids = set()
-pc_sids = {}  # sid -> device_name（PC 客户端）
-grace_sids = set()  # 断线宽限期内的手机 sid（切后台回前台可无感恢复）
+phone_sids = set()                 # 当前在线手机 sid
+phone_device_ids = {}             # sid -> 稳定设备 ID（浏览器 localStorage）
+device_id_sids = {}               # 稳定设备 ID -> 当前 sid
+pc_sids = {}                      # sid -> {'name', 'ip'}
 _temp_zip_files = set()
+
+RUNTIME_PORT = 5000               # 实际监听端口（被占用时自动顺延）
+SESSION_TTL = 30 * 60             # 未完成上传会话的空闲保留时长
+GRACE_SECONDS = 90                # 手机断线宽限期，需覆盖 ping_timeout 与重连耗时
+
+
+@app.before_request
+def _lan_only():
+    """只接受局域网来源，不做任何需要用户操作的鉴权。"""
+    addr = request.remote_addr or ''
+    try:
+        ip = ipaddress.ip_address(addr)
+        if not (ip.is_private or ip.is_loopback or ip.is_link_local):
+            return '仅允许局域网访问', 403
+    except ValueError:
+        return '无法识别的来源地址', 403
 
 PHONE_PAGE = """
 <!DOCTYPE html>
@@ -170,9 +187,17 @@ PHONE_PAGE = """
         const activeUploads = {}; // upload_id -> 上传会话（断点续传用）
         const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB 分片
         const UPLOAD_PARALLEL = 2;          // 每个文件并行分片数
+        const MAX_FILE_PARALLEL = 3;        // 同时上传的文件数上限，避免目录上传压垮服务端
+
+        // 稳定设备 ID：锁屏/切后台/换网络重连后仍是同一台设备，聊天记录不会丢
+        let deviceId = localStorage.getItem('lft_device_id');
+        if (!deviceId) {
+            deviceId = 'p-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+            localStorage.setItem('lft_device_id', deviceId);
+        }
 
         socket.on('connect', () => {
-            socket.emit('identify', {type: 'phone'});
+            socket.emit('identify', {type: 'phone', device_id: deviceId});
             addStatus('已连接到电脑');
             // 断线重连后，自动恢复所有未完成的上传（断点续传）
             for (const uploadId of Object.keys(activeUploads)) {
@@ -186,7 +211,7 @@ PHONE_PAGE = """
         });
 
         socket.on('disconnect', () => {
-            addStatus('连接断开');
+            addStatus('连接中断，正在自动重连…');
         });
 
         socket.on('text_message', (data) => {
@@ -194,7 +219,18 @@ PHONE_PAGE = """
         });
 
         socket.on('file_download', (data) => {
-            const link = `<a class="file-link" href="${data.url}" download>📁 ${data.filename}</a>`;
+            let url;
+            try {
+                url = new URL(data.url || '', location.href);
+            } catch (e) {
+                return;
+            }
+            if (url.origin !== location.origin) return;   // 只接受同源下载链接
+            const link = document.createElement('a');
+            link.className = 'file-link';
+            link.href = url.href;
+            link.textContent = '📁 ' + (data.filename || '文件');
+            link.setAttribute('download', data.filename || '');
             addMessage(link, 'remote');
         });
 
@@ -205,7 +241,8 @@ PHONE_PAGE = """
         function addMessage(content, type) {
             const div = document.createElement('div');
             div.className = `msg ${type}`;
-            div.innerHTML = content;
+            if (content instanceof Node) div.appendChild(content);
+            else div.textContent = content == null ? '' : String(content);
             messagesDiv.appendChild(div);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
@@ -228,18 +265,39 @@ PHONE_PAGE = """
             input.dispatchEvent(new Event('input'));
         }
 
+        // 全局队列：一次最多 3 个文件同时上传，选整个目录也不会瞬间打出上千请求
+        const fileQueue = [];
+        let activeFiles = 0;
+
+        function enqueueFile(file, displayName, totalCount, callback) {
+            fileQueue.push({file, displayName, totalCount, callback});
+            pumpQueue();
+        }
+
+        function pumpQueue() {
+            while (activeFiles < MAX_FILE_PARALLEL && fileQueue.length > 0) {
+                const item = fileQueue.shift();
+                activeFiles++;
+                sendSingleFile(item.file, item.displayName, item.totalCount, (ok) => {
+                    activeFiles--;
+                    item.callback(ok);
+                    pumpQueue();
+                });
+            }
+        }
+
         function sendFiles(files) {
             if (!files || files.length === 0) return;
-            
+
             const fileCount = files.length;
             addStatus(`📤 准备上传 ${fileCount} 个文件...`);
-            
+
             let successCount = 0;
             let processedCount = 0;
-            
+
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
-                sendSingleFile(file, file.name, fileCount, function(success) {
+                enqueueFile(file, file.name, fileCount, function(success) {
                     processedCount++;
                     if (success) successCount++;
                     if (processedCount === fileCount) {
@@ -247,23 +305,23 @@ PHONE_PAGE = """
                     }
                 });
             }
-            
+
             document.getElementById('fileInput').value = '';
         }
-        
+
         function sendDirectory(files) {
             if (!files || files.length === 0) return;
-            
+
             const fileCount = files.length;
             addStatus(`📁 准备发送目录，共 ${fileCount} 个文件...`);
-            
+
             let successCount = 0;
             let processedCount = 0;
-            
+
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
                 const displayName = file.webkitRelativePath || file.name;
-                sendSingleFile(file, displayName, fileCount, function(success) {
+                enqueueFile(file, displayName, fileCount, function(success) {
                     processedCount++;
                     if (success) successCount++;
                     if (processedCount === fileCount) {
@@ -271,7 +329,7 @@ PHONE_PAGE = """
                     }
                 });
             }
-            
+
             document.getElementById('dirInput').value = '';
         }
         
@@ -289,12 +347,18 @@ PHONE_PAGE = """
             if (sizeEl) sizeEl.textContent = formatSize(bytes);
         }
 
+        let uploadSeq = 0;
         function sendSingleFile(file, displayName, totalCount, callback) {
-            const sizeId = `upload-size-${displayName.replace(/[^a-zA-Z0-9]/g, '_')}`;
+            const sizeId = `upload-size-${++uploadSeq}`;
 
             const statusDiv = document.createElement('div');
             statusDiv.className = 'status';
-            statusDiv.innerHTML = `📤 正在上传: ${displayName} (<span id="${sizeId}">0</span>/${formatSize(file.size)})`;
+            statusDiv.appendChild(document.createTextNode(`📤 正在上传: ${displayName} (`));
+            const sizeSpan = document.createElement('span');
+            sizeSpan.id = sizeId;
+            sizeSpan.textContent = '0';
+            statusDiv.appendChild(sizeSpan);
+            statusDiv.appendChild(document.createTextNode(`/${formatSize(file.size})`));
             messagesDiv.appendChild(statusDiv);
 
             const progressContainer = document.createElement('div');
@@ -333,7 +397,7 @@ PHONE_PAGE = """
             xhr.send(fd);
 
             function fail(msg) {
-                statusDiv.innerHTML = `❌ 上传失败: ${displayName} (${msg})`;
+                statusDiv.textContent = `❌ 上传失败: ${displayName} (${msg})`;
                 progressBar.style.backgroundColor = '#e74c3c';
                 if (callback) callback(false);
             }
@@ -346,6 +410,15 @@ PHONE_PAGE = """
             fetch(`/upload/status?upload_id=${uploadId}`)
                 .then(r => r.json())
                 .then(d => {
+                    if (d.status !== 'ok') {
+                        // 会话已失效（如服务重启）：明确失败，不再对着失效 id 无限重传
+                        up.running = false;
+                        up.statusDiv.textContent = `❌ 上传失败: ${up.displayName} (会话已失效，请重发)`;
+                        up.progressBar.style.backgroundColor = '#e74c3c';
+                        delete activeUploads[uploadId];
+                        if (up.callback) up.callback(false);
+                        return;
+                    }
                     (d.received || []).forEach(i => { if (!up.received.has(i)) up.received.add(i); });
                     updateProgress(up);
                     runWorkers(uploadId);
@@ -429,11 +502,11 @@ PHONE_PAGE = """
                         socket.emit('file_uploaded', { file_id: d.file_id, filename: up.displayName });
                         up.progressBar.style.width = '100%';
                         up.progressBar.style.backgroundColor = '#00b894';
-                        up.statusDiv.innerHTML = `✅ 上传成功: ${up.displayName}`;
+                        up.statusDiv.textContent = `✅ 上传成功: ${up.displayName}`;
                         delete activeUploads[uploadId];
                         if (up.callback) up.callback(true);
                     } else {
-                        up.statusDiv.innerHTML = `❌ 上传失败: ${d.msg || '合并失败'}`;
+                        up.statusDiv.textContent = `❌ 上传失败: ${d.msg || '合并失败'}`;
                         up.progressBar.style.backgroundColor = '#e74c3c';
                         delete activeUploads[uploadId];
                         if (up.callback) up.callback(false);
@@ -451,7 +524,7 @@ PHONE_PAGE = """
             if (bytes === 0) return '0 B';
             const k = 1024;
             const sizes = ['B', 'KB', 'MB', 'GB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
@@ -573,6 +646,9 @@ def upload_init():
         'chunk_size': CHUNK_SIZE_DEFAULT,
         'md5': data.get('md5') or None,
         'received': set(),
+        'last_active': time.time(),
+        'finished': False,
+        'file_id': None,
     }
     return {'status': 'ok', 'upload_id': upload_id, 'chunk_size': CHUNK_SIZE_DEFAULT}
 
@@ -600,6 +676,7 @@ def upload_chunk():
     blob.save(tmp_path)
     os.replace(tmp_path, final_path)
     session['received'].add(index)
+    session['last_active'] = time.time()
     return {'status': 'ok'}
 
 
@@ -620,18 +697,26 @@ def upload_status():
 
 @app.route('/upload/finish', methods=['POST'])
 def upload_finish():
+    """合并分片；幂等且不在失败时销毁会话，保证断点续传可用。"""
     data = request.get_json(silent=True) or request.form or {}
     upload_id = data.get('upload_id', '')
-    session = upload_sessions.pop(upload_id, None)
+    session = upload_sessions.get(upload_id)
     if not session:
         return {'status': 'error', 'msg': '上传会话不存在'}, 404
+
+    # 网络重试导致重复 finish：直接返回第一次的结果
+    if session.get('finished'):
+        return {'status': 'ok', 'file_id': session['file_id'],
+                'filename': session['filename']}
+
     if len(session['received']) < session['total']:
-        return {'status': 'error', 'msg': f"分片不完整 ({len(session['received'])}/{session['total']})"}, 400
+        # 不删除会话，客户端可继续查询已收分片后续传
+        session['last_active'] = time.time()
+        return {'status': 'error',
+                'msg': f"分片不完整 ({len(session['received'])}/{session['total']})"}, 400
 
     file_id = uuid.uuid4().hex[:8]
     save_path = os.path.join(UPLOAD_FOLDER, f"{file_id}_{session['safe_filename']}")
-
-    # 顺序合并分片（1MB 写盘缓冲），可选 MD5 校验
     md5 = hashlib.md5() if session.get('md5') else None
     try:
         with open(save_path, 'wb') as out:
@@ -644,13 +729,25 @@ def upload_finish():
                         out.write(block)
                         if md5 is not None:
                             md5.update(block)
+                gevent.sleep(0)  # 让出 hub，避免大文件合并期间心跳与其它连接饿死
         if md5 is not None and md5.hexdigest() != session['md5']:
-            os.remove(save_path)
-            return {'status': 'error', 'msg': 'MD5 校验失败，请重传'}, 400
-    finally:
-        shutil.rmtree(session['dir'], ignore_errors=True)
+            raise ValueError('MD5 校验失败，请重传')
+    except Exception as e:
+        try:
+            if os.path.exists(save_path):
+                os.remove(save_path)
+        except OSError:
+            pass
+        # 清空已收标记，让客户端重传全部分片
+        session['received'].clear()
+        session['last_active'] = time.time()
+        return {'status': 'error', 'msg': f'合并失败，请重传: {e}'}, 400
 
+    shutil.rmtree(session['dir'], ignore_errors=True)
     phone_uploads[file_id] = save_path
+    session['finished'] = True
+    session['file_id'] = file_id
+    session['last_active'] = time.time()
     return {'status': 'ok', 'file_id': file_id, 'filename': session['filename']}
 
 def stream_file_response(filepath, filename):
@@ -669,6 +766,7 @@ def stream_file_response(filepath, filename):
         ascii_name = filename
     except UnicodeEncodeError:
         ascii_name = 'download'
+    ascii_name = ascii_name.replace('"', "'").replace('\r', '').replace('\n', '')
     resp.headers['Content-Disposition'] = (
         f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename)}'
     )
@@ -693,107 +791,117 @@ def get_file(file_id):
 @socketio.on('connect')
 def handle_connect():
     from flask import request
-    sid = request.sid
-    phone_sids.add(sid)
-    print('新连接, sid:', sid)
+    print('新连接, sid:', request.sid)
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
     from flask import request
     sid = request.sid
 
-    # 从 pc_sids 移除
-    pc_name = pc_sids.pop(sid, None)
-    if pc_name:
-        print(f'PC 断开连接: {pc_name} (sid: {sid[:4]})')
-        signal_emitter.device_disconnected.emit(sid)
+    pc_info = pc_sids.pop(sid, None)
+    if pc_info:
+        print(f'PC 断开连接: {pc_info["name"]} (sid: {sid[:4]})')
+        return  # PC 设备由 UDP 发现管理，不以 sid 作为设备 key
+
+    if sid not in phone_sids:
         return
 
-    # 手机断开：进入 5 秒宽限期，不立即通知 UI
-    # （手机切后台时浏览器冻结页面、心跳停发是常态，回前台后 socket.io 会自动重连并重新 identify）
-    was_phone = sid in phone_sids
     phone_sids.discard(sid)
+    device_id = phone_device_ids.pop(sid, None)
+    key = device_id or sid
+    print(f'手机连接中断: {key} (进入 {GRACE_SECONDS} 秒宽限期)')
 
-    if was_phone:
-        grace_sids.add(sid)
-        print(f'手机连接中断, sid: {sid[:4]} (进入 5 秒宽限期)')
-
-        def _grace_check():
-            gevent.sleep(5)
-            grace_sids.discard(sid)
-            if phone_sids:
-                # 宽限期内已有其他手机连接（或本机重连拿到新 sid），无需处理
-                signal_emitter.device_disconnected.emit(sid)
-                return
-            print(f'手机确认离线 (宽限期内未恢复), sid: {sid[:4]}')
+    def _grace_check():
+        gevent.sleep(GRACE_SECONDS)
+        if device_id:
+            current = device_id_sids.get(device_id)
+            if current and current != sid:
+                return  # 已用新 sid 回来（切后台/换网络），设备与聊天记录都保留
+            device_id_sids.pop(device_id, None)
+        if not phone_sids:
             signal_emitter.phone_connected.emit(False)
-            signal_emitter.phone_sid_updated.emit(None)
-            signal_emitter.device_disconnected.emit(sid)
+            signal_emitter.phone_sid_updated.emit('')
+        signal_emitter.device_disconnected.emit(key)
 
-        gevent.spawn(_grace_check)
+    gevent.spawn(_grace_check)
+
 
 @socketio.on('identify')
 def handle_identify(data):
-    """客户端身份识别：区分手机 / PC 客户端"""
+    """客户端身份识别：手机用稳定 device_id，PC 客户端带上来源 IP。"""
     from flask import request
+    data = data or {}
     sid = request.sid
-    client_type = data.get('type', '')
-    client_name = data.get('name', 'Unknown')
+    client_name = str(data.get('name', 'Unknown'))[:64]
 
-    if client_type == 'pc':
-        # 从 phone_sids 移入 pc_sids
-        phone_sids.discard(sid)
-        pc_sids[sid] = client_name
-        display_name = f"🖥️ {client_name}"
+    if data.get('type') == 'pc':
+        pc_sids[sid] = {'name': client_name, 'ip': data.get('ip', '')}
         print(f'PC 客户端已识别: {client_name} (sid: {sid[:4]})')
-        signal_emitter.device_connected.emit(sid, 'pc', display_name)
-    else:
-        # 手机客户端（默认已加入 phone_sids）
-        print(f'手机客户端已识别: {sid[:4]}')
-        signal_emitter.phone_connected.emit(True)
-        signal_emitter.phone_sid_updated.emit(sid)
-        signal_emitter.device_connected.emit(sid, 'phone', f'手机-{sid[:4]}')
+        return
+
+    device_id = str(data.get('device_id') or sid)[:64]
+    old_sid = device_id_sids.get(device_id)
+    if old_sid and old_sid != sid:
+        phone_sids.discard(old_sid)
+        phone_device_ids.pop(old_sid, None)
+    device_id_sids[device_id] = sid
+    phone_device_ids[sid] = device_id
+    phone_sids.add(sid)
+
+    print(f'手机客户端已识别: {device_id} (sid: {sid[:4]})')
+    signal_emitter.phone_connected.emit(True)
+    signal_emitter.phone_sid_updated.emit(sid)
+    signal_emitter.device_connected.emit(device_id, 'phone', f'手机-{device_id[-4:]}', sid)
+
 
 @socketio.on('text_message')
 def handle_text_message(data):
     from flask import request
+    data = data or {}
     msg = data.get('message', '')
     sid = request.sid
 
     if sid in pc_sids:
-        # 来自 PC 客户端
-        pc_name = pc_sids[sid]
-        source_msg = f"[{pc_name}] {msg}"
+        info = pc_sids[sid]
+        source_msg = f"[{info['name']}] {msg}"
         print(f"收到 PC 文本: {source_msg}")
-        signal_emitter.received_text.emit(source_msg, 'remote_pc')
+        signal_emitter.pc_message.emit(source_msg, info.get('ip', ''))
     else:
-        # 来自手机
-        source_msg = f"[{sid[:4]}] {msg}"
+        key = phone_device_ids.get(sid, sid)
+        source_msg = f"[{key[-4:]}] {msg}"
         print(f"收到手机文本: {source_msg}")
-        signal_emitter.phone_text_sid.emit(sid)
+        signal_emitter.phone_text_key.emit(key)
         signal_emitter.received_text.emit(source_msg, 'phone')
 
-@socketio.on('upload_complete')
-def handle_upload_complete(data):
-    msg = f"📤 手机上传了文件: {data.get('filename')} ({data.get('size')} 字节)"
-    signal_emitter.received_text.emit(msg, 'system')
 
 @socketio.on('file_uploaded')
 def handle_file_uploaded(data):
     from flask import request
+    data = data or {}
     file_id = data.get('file_id')
     filename = data.get('filename')
     source_sid = request.sid
 
     if source_sid in pc_sids:
-        # 来自 PC 客户端
-        pc_name = pc_sids[source_sid]
-        print(f"PC 发送文件完成: {filename} (来自: {pc_name})")
+        print(f"PC 发送文件完成: {filename} (来自: {pc_sids[source_sid]['name']})")
         signal_emitter.received_file.emit(file_id, filename, 'pc')
     else:
-        # 来自手机
-        print(f"手机上传文件完成: {filename} (来源: {source_sid[:4]})")
-        signal_emitter.received_file.emit(file_id, filename, source_sid)
+        key = phone_device_ids.get(source_sid, source_sid)
+        print(f"手机上传文件完成: {filename} (来源: {key})")
+        signal_emitter.received_file.emit(file_id, filename, key)
+
+def cleanup_expired_sessions():
+    """清理长时间未完成 / 已完成的上传会话，避免内存与磁盘碎片无限增长。"""
+    while True:
+        gevent.sleep(60)
+        now = time.time()
+        for upload_id, session in list(upload_sessions.items()):
+            ttl = 5 * 60 if session.get('finished') else SESSION_TTL
+            if now - session.get('last_active', now) > ttl:
+                upload_sessions.pop(upload_id, None)
+                shutil.rmtree(session['dir'], ignore_errors=True)
+
 
 def cleanup_temp_files():
     files_to_remove = list(_temp_zip_files)
@@ -809,13 +917,25 @@ def cleanup_temp_files():
 atexit.register(cleanup_temp_files)
 atexit.register(cleanup_chunk_folder)
 
-def start_flask(host='0.0.0.0', port=5000):
-    """启动传输服务。
 
-    与 flask_socketio.run 的 gevent 分支等价：装了 gevent-websocket 就用它的
-    WebSocketHandler，否则由 engineio/simple-websocket 在应用层完成握手；
-    并对每个接入连接调大 socket 缓冲区、禁用 Nagle，以跑满局域网带宽。
-    """
+def _pick_port(host, port, tries=20):
+    """找第一个可绑定端口；不设 SO_REUSEADDR，避免 Windows 上把占用端口误判为可用。"""
+    import socket
+    for candidate in range(port, port + tries):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, candidate))
+            return candidate
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return None
+
+
+def start_flask(host='0.0.0.0', port=5000):
+    """启动传输服务：端口自动顺延、状态实时通知 UI、异常后自动重启。"""
+    global RUNTIME_PORT
     import socket
     from gevent import pywsgi
 
@@ -837,10 +957,36 @@ def start_flask(host='0.0.0.0', port=5000):
     except ImportError:
         print('WebSocket 传输: simple-websocket(engineio 内置)')
 
-    cleanup_chunk_folder()
-    server = TunedWSGIServer((host, port), app, **server_kwargs)
-    print(f'传输服务已启动: http://{host}:{port}')
-    try:
-        server.serve_forever()
-    except Exception as e:
-        print(f'传输服务异常退出: {e}')
+    cleanup_chunk_folder()  # 仅进程首次启动时清残留；自动重启不清，避免打断续传
+    gevent.spawn(cleanup_expired_sessions)
+
+    first = True
+    backoff = 1
+    while True:
+        # 重启时优先复用原端口，避免已发出的二维码/链接失效
+        chosen = None if first else _pick_port(host, RUNTIME_PORT, tries=1)
+        if chosen is None:
+            chosen = _pick_port(host, port)
+        if chosen is None:
+            signal_emitter.server_status.emit(False, 0, '没有可用端口，5 秒后重试')
+            gevent.sleep(5)
+            continue
+
+        RUNTIME_PORT = chosen
+        server = TunedWSGIServer((host, chosen), app, **server_kwargs)
+        signal_emitter.server_status.emit(True, chosen, f'服务已启动，端口 {chosen}')
+        print(f'传输服务已启动: http://{host}:{chosen}')
+        try:
+            server.serve_forever()
+            reason = '服务已停止，正在自动恢复'
+        except Exception as e:
+            reason = f'服务异常退出: {e}'
+        try:
+            server.stop()
+        except Exception:
+            pass
+        signal_emitter.server_status.emit(False, chosen, reason)
+        print(f'{reason}，{backoff} 秒后自动重启')
+        gevent.sleep(backoff)
+        backoff = min(backoff * 2, 10)
+        first = False

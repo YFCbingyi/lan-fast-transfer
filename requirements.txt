@@ -1,5 +1,9 @@
 flask==2.3.3
 flask-socketio==5.3.6
+python-socketio==5.16.2
+python-engineio==4.13.2
+simple-websocket==1.1.0
+websocket-client==1.9.2
 gevent==23.9.1
 qrcode==7.4.2
 Pillow==10.0.1

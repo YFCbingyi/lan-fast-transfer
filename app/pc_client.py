@@ -2,6 +2,7 @@ import os
 import socket
 import time
 import uuid
+import threading
 
 import requests
 import socketio
@@ -20,12 +21,12 @@ class PCClient(QObject):
 
     def __init__(self, target_ip, target_port=5000,
                  on_message=None, on_file=None,
-                 on_connected=None, on_disconnected=None):
+                 on_connected=None, on_disconnected=None, own_ip=''):
         super().__init__()
         self.target_ip = target_ip
         self.target_port = target_port
+        self.own_ip = own_ip
 
-        # 回调函数（非 Qt 环境使用）
         self.on_message = on_message
         self.on_file = on_file
         self.on_connected = on_connected
@@ -33,37 +34,41 @@ class PCClient(QObject):
 
         self.sio = None
         self._connected = False
-        self.own_name = os.environ.get('COMPUTERNAME') or socket.gethostname()
+        self._manual_close = False
+        self._reconnect_thread = None
+        self.own_name = socket.gethostname()
 
     @property
     def base_url(self):
         return f"http://{self.target_ip}:{self.target_port}"
 
-    def connect(self):
-        """建立连接
-
-        流程：
-          1. HTTP GET 根路径验证目标 PC 可达
-          2. 创建 SocketIO 客户端并建立 WebSocket 连接
-          3. 连接成功后发送 identify 事件注册为 pc_client
-        """
-        if self._connected:
-            self.disconnect()
+    def connect(self, reopen=False):
+        """建立连接；reopen=True 用于断线后的自动重连。"""
+        if not reopen:
+            self._manual_close = False
+        self._connected = False
+        if self.sio is not None:
+            try:
+                self.sio.disconnect()
+            except Exception:
+                pass
+            self.sio = None
 
         # Step 1: HTTP 可达性验证
         try:
-            resp = requests.get(self.base_url, timeout=5)
+            resp = requests.get(self.base_url, timeout=3)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise ConnectionError(f"目标 PC 不可达: {e}")
 
-        # Step 2: SocketIO 客户端
-        self.sio = socketio.Client()
+        # Step 2: SocketIO 客户端（重连由本模块的退避循环负责）
+        self.sio = socketio.Client(reconnection=False)
 
         @self.sio.on('connect')
         def on_connect():
-            # Step 3: 发送识别事件
-            self.sio.emit('identify', {'type': 'pc', 'name': self.own_name})
+            self.sio.emit('identify', {
+                'type': 'pc', 'name': self.own_name, 'ip': self.own_ip
+            })
             self._connected = True
             self.connected.emit()
             if self.on_connected:
@@ -75,6 +80,8 @@ class PCClient(QObject):
             self.disconnected.emit()
             if self.on_disconnected:
                 self.on_disconnected()
+            if not self._manual_close:
+                self._schedule_reconnect()
 
         @self.sio.on('text_message')
         def on_text_message(data):
@@ -92,26 +99,44 @@ class PCClient(QObject):
             if self.on_file:
                 self.on_file(file_id, filename)
 
-        self.sio.connect(self.base_url)
+        # Step 3: 优先直连 WebSocket（跳过 polling 握手，建连更快、断开更利落），
+        # 服务端不支持时自动回退 polling
+        self.sio.connect(self.base_url, transports=['websocket', 'polling'],
+                         wait_timeout=3)
+
+    def _schedule_reconnect(self):
+        if self._manual_close:
+            return
+        t = self._reconnect_thread
+        if t and t.is_alive():
+            return
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, daemon=True, name='PCReconnect')
+        self._reconnect_thread.start()
+
+    def _reconnect_loop(self):
+        """意外断开后指数退避自动重连，让 PC 之间"随时能连上"。"""
+        delay = 2
+        while not self._manual_close and not self._connected:
+            time.sleep(delay)
+            if self._manual_close or self._connected:
+                return
+            try:
+                self.connect(reopen=True)
+                print(f"PC 已自动重连: {self.target_ip}")
+                return
+            except Exception:
+                delay = min(delay * 2, 30)
 
     def send_text(self, text):
-        """发送文字消息"""
         if not self._connected or not self.sio:
             raise ConnectionError("未连接到目标 PC")
         self.sio.emit('text_message', {'message': text})
 
-    def send_file(self, file_path, progress_cb=None):
-        """发送文件（分片上传协议，支持大文件与失败重试）
-
-        流程：
-          1. POST /upload/init 创建上传会话，得到 upload_id
-          2. 逐片 POST /upload/chunk（单片失败重试 3 次）
-          3. POST /upload/finish 合并分片，得到 file_id
-          4. 通过 SocketIO 发送 file_uploaded 事件通知
-        """
+    def send_file(self, file_path, progress_cb=None, cancel_event=None):
+        """发送文件（分片上传协议），支持进度回调与取消。"""
         if not self._connected or not self.sio:
             raise ConnectionError("未连接到目标 PC")
-
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"文件不存在: {file_path}")
 
@@ -119,7 +144,6 @@ class PCClient(QObject):
         file_size = os.path.getsize(file_path)
         total_chunks = max(1, (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
 
-        # Step 1: 初始化上传会话
         resp = requests.post(
             f"{self.base_url}/upload/init",
             json={'filename': filename, 'size': file_size, 'total': total_chunks},
@@ -132,9 +156,10 @@ class PCClient(QObject):
             raise RuntimeError(f"初始化上传失败: {result.get('msg', '未知错误')}")
         upload_id = result['upload_id']
 
-        # Step 2: 逐片上传
         with open(file_path, 'rb') as f:
             for index in range(total_chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("传输已取消")
                 data = f.read(CHUNK_SIZE)
                 if not data:
                     break
@@ -142,7 +167,9 @@ class PCClient(QObject):
                 if progress_cb:
                     progress_cb(min(file_size, (index + 1) * CHUNK_SIZE), file_size)
 
-        # Step 3: 合并分片
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("传输已取消")
+
         resp = requests.post(
             f"{self.base_url}/upload/finish",
             data={'upload_id': upload_id},
@@ -155,13 +182,7 @@ class PCClient(QObject):
             raise RuntimeError(f"合并文件失败: {result.get('msg', '未知错误')}")
 
         file_id = result['file_id']
-
-        # Step 4: SocketIO 通知
-        self.sio.emit('file_uploaded', {
-            'file_id': file_id,
-            'filename': filename
-        })
-
+        self.sio.emit('file_uploaded', {'file_id': file_id, 'filename': filename})
         return file_id
 
     def _post_chunk(self, upload_id, index, data):
@@ -184,8 +205,19 @@ class PCClient(QObject):
         raise RuntimeError(f"分片 {index} 上传失败（已重试 3 次）: {last_error}")
 
     def disconnect(self):
-        """断开连接"""
-        if self.sio and self._connected:
-            self.sio.disconnect()
+        """主动断开（不触发自动重连），不阻塞调用方（通常是 Qt 主线程）。"""
+        self._manual_close = True
         self._connected = False
-        self.sio = None
+        sio, self.sio = self.sio, None
+        if sio is None:
+            return
+
+        def _close():
+            try:
+                sio.disconnect()
+            except Exception:
+                pass
+
+        # polling 模式下 disconnect 要等一次网络往返，可能拖上数秒；
+        # 放到后台线程，避免切换设备 / 关闭窗口时界面卡住
+        threading.Thread(target=_close, daemon=True, name='PCDisconnect').start()

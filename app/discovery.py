@@ -2,6 +2,7 @@ import json
 import socket
 import time
 import threading
+import ipaddress
 
 from PyQt5.QtCore import pyqtSignal, QObject
 
@@ -12,7 +13,7 @@ class DeviceDiscovery(QObject):
 
     BROADCAST_PORT = 51234
     BROADCAST_INTERVAL = 3
-    TIMEOUT_THRESHOLD = 10
+    TIMEOUT_THRESHOLD = 15  # 5 次广播未收到才判离线，避免列表闪烁
 
     def __init__(self, own_name, own_ip, own_port=5000):
         super().__init__()
@@ -30,6 +31,14 @@ class DeviceDiscovery(QObject):
         self.on_device_found = None
         self.on_device_lost = None
 
+    @staticmethod
+    def _valid_ip(ip):
+        try:
+            addr = ipaddress.ip_address(str(ip))
+            return addr.version == 4 and not addr.is_loopback and not addr.is_multicast
+        except ValueError:
+            return False
+
     def _get_broadcast_data(self):
         return {
             'device_name': self._own_name,
@@ -38,8 +47,20 @@ class DeviceDiscovery(QObject):
             'timestamp': time.time()
         }
 
+    def set_endpoint(self, ip, port=None):
+        """网络切换 / 服务换端口时更新广播内容（不重建对象）。"""
+        new_port = port or self._own_port
+        if ip == self._own_ip and new_port == self._own_port:
+            return
+        was_running = self._running
+        if was_running:
+            self.stop()
+        self._own_ip = ip
+        self._own_port = new_port
+        if was_running:
+            self.start()
+
     def _broadcast_loop(self):
-        # 发送套接字：绑定到具体 IP，确保广播从该 IP 对应的物理网卡发出
         send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -51,11 +72,22 @@ class DeviceDiscovery(QObject):
             return
         send_sock.settimeout(1)
 
+        # 全局广播 + /24 定向广播：多网卡 / 路由器对 255.255.255.255 转发不一致时仍能发现
+        targets = ['255.255.255.255']
+        parts = self._own_ip.split('.')
+        if len(parts) == 4:
+            directed = f'{parts[0]}.{parts[1]}.{parts[2]}.255'
+            if directed not in targets:
+                targets.append(directed)
+
         while not self._stop_event.is_set():
             try:
-                data = self._get_broadcast_data()
-                message = json.dumps(data).encode('utf-8')
-                send_sock.sendto(message, ('255.255.255.255', self.BROADCAST_PORT))
+                message = json.dumps(self._get_broadcast_data()).encode('utf-8')
+                for target in targets:
+                    try:
+                        send_sock.sendto(message, (target, self.BROADCAST_PORT))
+                    except Exception as e:
+                        print(f"广播发送失败({target}): {e}")
             except Exception as e:
                 print(f"广播发送失败: {e}")
 
@@ -74,6 +106,7 @@ class DeviceDiscovery(QObject):
             recv_sock.bind(('0.0.0.0', self.BROADCAST_PORT))
         except Exception as e:
             print(f"绑定监听端口失败: {e}")
+            recv_sock.close()
             return
 
         while not self._stop_event.is_set():
@@ -82,23 +115,27 @@ class DeviceDiscovery(QObject):
                 message = json.loads(data.decode('utf-8'))
 
                 device_ip = message.get('ip', addr[0])
-
+                if not self._valid_ip(device_ip):
+                    device_ip = addr[0]
                 if device_ip == self._own_ip:
                     continue
 
+                try:
+                    port = int(message.get('port', 5000))
+                    if not 1 <= port <= 65535:
+                        port = 5000
+                except (TypeError, ValueError):
+                    port = 5000
+
                 device_info = {
-                    'device_name': message.get('device_name', 'Unknown'),
+                    'device_name': str(message.get('device_name', 'Unknown'))[:64],
                     'ip': device_ip,
-                    'port': message.get('port', 5000),
+                    'port': port,
                     'timestamp': message.get('timestamp', time.time())
                 }
 
                 is_new = device_ip not in self._devices
-
-                self._devices[device_ip] = {
-                    **device_info,
-                    'last_seen': time.time()
-                }
+                self._devices[device_ip] = {**device_info, 'last_seen': time.time()}
 
                 if is_new:
                     print(f"发现新设备: {device_info['device_name']} ({device_ip})")
@@ -118,62 +155,45 @@ class DeviceDiscovery(QObject):
     def _timeout_check_loop(self):
         while not self._stop_event.is_set():
             current_time = time.time()
-            lost_devices = []
-
             for ip, info in list(self._devices.items()):
                 if current_time - info['last_seen'] > self.TIMEOUT_THRESHOLD:
-                    lost_devices.append(ip)
-
-            for ip in lost_devices:
-                device_info = self._devices.pop(ip, None)
-                if device_info:
-                    emit_info = {k: v for k, v in device_info.items() if k != 'last_seen'}
-                    print(f"设备离线: {emit_info['device_name']} ({ip})")
-                    self.device_lost.emit(emit_info)
-                    if self.on_device_lost:
-                        self.on_device_lost(emit_info)
-
+                    lost = self._devices.pop(ip, None)
+                    if lost:
+                        emit_info = {k: v for k, v in lost.items() if k != 'last_seen'}
+                        print(f"设备离线: {emit_info['device_name']} ({ip})")
+                        self.device_lost.emit(emit_info)
+                        if self.on_device_lost:
+                            self.on_device_lost(emit_info)
             self._stop_event.wait(1)
 
     def start(self):
         if self._running:
             return
-
         self._running = True
         self._stop_event.clear()
-
         self._broadcast_thread = threading.Thread(
-            target=self._broadcast_loop, daemon=True, name='DiscoveryBroadcast'
-        )
+            target=self._broadcast_loop, daemon=True, name='DiscoveryBroadcast')
         self._listen_thread = threading.Thread(
-            target=self._listen_loop, daemon=True, name='DiscoveryListen'
-        )
+            target=self._listen_loop, daemon=True, name='DiscoveryListen')
         self._timeout_thread = threading.Thread(
-            target=self._timeout_check_loop, daemon=True, name='DiscoveryTimeout'
-        )
-
+            target=self._timeout_check_loop, daemon=True, name='DiscoveryTimeout')
         self._broadcast_thread.start()
         self._listen_thread.start()
         self._timeout_thread.start()
-
         print(f"设备发现已启动 (设备名: {self._own_name}, IP: {self._own_ip}, 端口: {self._own_port})")
 
     def stop(self):
         if not self._running:
             return
-
         self._running = False
         self._stop_event.set()
-
         for thread in [self._broadcast_thread, self._listen_thread, self._timeout_thread]:
             if thread and thread.is_alive():
                 thread.join(timeout=2)
-
         self._broadcast_thread = None
         self._listen_thread = None
         self._timeout_thread = None
         self._devices.clear()
-
         print("设备发现已停止")
 
     @property

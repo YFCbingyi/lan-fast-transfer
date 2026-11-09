@@ -1,26 +1,26 @@
 import os
-import sys
+import html
 import uuid
 import zipfile
 import tempfile
 import socket
+import threading
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QPushButton, QFileDialog, QDialog, QScrollArea,
-    QListWidget, QListWidgetItem, QSplitter, QFrame
+    QListWidget, QListWidgetItem, QSplitter, QFrame, QComboBox
 )
-from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtCore import Qt, QEvent, QTimer
 from PyQt5.QtGui import QPixmap, QColor, QFont
 import qrcode
-from PIL import Image
 from io import BytesIO
 
+from app import server as srv
 from app.signal import signal_emitter
-from app.config import save_config, DEFAULT_DOWNLOAD_FOLDER
+from app.config import save_config, load_config
 from app.utils import get_lan_ips, format_size
-from app.server import temp_downloads, _temp_zip_files, socketio, phone_sids
 from app.discovery import DeviceDiscovery
 from app.pc_client import PCClient
 from app.ui.device_selector import DeviceSelector
@@ -32,6 +32,10 @@ class LanChatWindow(QMainWindow):
         self.DOWNLOAD_FOLDER = download_folder
         self.phone_sid = None
         self.pc_client = None
+        self.lan_ip = self._choose_lan_ip()
+        self.current_port = srv.RUNTIME_PORT
+        self._service_alive = True
+        self._cancel_event = None
         self.setWindowTitle("局域网双向传输 v2.0")
         self.setGeometry(100, 100, 820, 650)
         self.setMinimumSize(680, 550)
@@ -40,7 +44,7 @@ class LanChatWindow(QMainWindow):
         self.devices = {}                        # key -> device_info
         self.chat_history = {}                   # key -> list of dicts
         self.current_chat_key = None             # 当前选中的设备 key
-        self._last_phone_sid = None              # 最近收到手机消息的 SID
+        self._last_phone_key = None              # 最近收到手机消息的设备 key
 
         # ---- 全局样式 ----
         self.setStyleSheet("""
@@ -139,62 +143,44 @@ class LanChatWindow(QMainWindow):
         signal_emitter.phone_connected.connect(self._update_phone_status)
         signal_emitter.received_file.connect(self.handle_received_file)
         signal_emitter.phone_sid_updated.connect(self.update_phone_sid)
-        signal_emitter.phone_text_sid.connect(self._on_phone_text_source)
+        signal_emitter.phone_text_key.connect(self._on_phone_text_source)
         signal_emitter.device_connected.connect(self._on_device_connected)
         signal_emitter.device_disconnected.connect(self._on_device_disconnected)
+        signal_emitter.server_status.connect(self._on_server_status)
+        signal_emitter.system_message.connect(self.add_system_message)
+        signal_emitter.send_progress.connect(self._on_send_progress)
+        signal_emitter.pc_message.connect(self._on_pc_message)
 
         # 设备发现
-        self.lan_ip = self._choose_lan_ip()
         hostname = socket.gethostname()
-        self.discovery = DeviceDiscovery(hostname, self.lan_ip)
+        self.discovery = DeviceDiscovery(hostname, self.lan_ip, self.current_port)
         self.discovery.device_found.connect(self._on_pc_device_found)
         self.discovery.device_lost.connect(self._on_pc_device_lost)
         self.discovery.start()
 
+        # 传输进度 / 取消入口常驻状态栏，不占用聊天空间
+        self.cancel_btn = QPushButton("取消传输")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setFixedHeight(22)
+        self.cancel_btn.clicked.connect(self._cancel_transfer)
+        self.statusBar().addPermanentWidget(self.cancel_btn)
+
+        # 网络变化（换 Wi-Fi、插网线）自动复检，并兜底同步服务端口
+        self._net_timer = QTimer(self)
+        self._net_timer.timeout.connect(self._check_network)
+        self._net_timer.start(10000)
+        QTimer.singleShot(1500, self._sync_server_status)
+
         self.update_qr_and_ip()
+        self._refresh_status_label()
         self._show_placeholder()
         self.text_input.setFocus()
 
     def _choose_lan_ip(self):
-        """弹出 IP 选择对话框，让用户选择使用的局域网 IP。"""
+        """自动选默认路由出口 IP，启动不再弹框；需要时可在服务器信息面板手动切换。"""
         ips = get_lan_ips()
-        if len(ips) == 1:
-            print(f"使用局域网 IP: {ips[0]}")
-            return ips[0]
-
-        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QRadioButton,
-                                     QButtonGroup, QDialogButtonBox, QLabel)
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("选择局域网 IP")
-        dialog.setMinimumWidth(400)
-
-        layout = QVBoxLayout(dialog)
-
-        layout.addWidget(QLabel("检测到多个局域网 IP，请选择要使用的地址："))
-
-        group = QButtonGroup(dialog)
-        for i, ip in enumerate(ips):
-            btn = QRadioButton(f"  {ip}")
-            if i == 0:
-                btn.setChecked(True)
-            group.addButton(btn, i)
-            layout.addWidget(btn)
-
-        layout.addSpacing(10)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        if dialog.exec_() == QDialog.Accepted:
-            selected = ips[group.checkedId()]
-        else:
-            selected = ips[0]  # 取消则用第一个
-
-        print(f"用户选择 IP: {selected}")
-        return selected
+        print(f"使用局域网 IP: {ips[0]}（候选: {', '.join(ips)}）")
+        return ips[0]
 
     # ================================================================
     # UI 构建
@@ -284,6 +270,13 @@ class LanChatWindow(QMainWindow):
         self.ip_label.setAlignment(Qt.AlignCenter)
         self.ip_label.setStyleSheet("font-size: 11px; color: #636e72;")
         info_layout.addWidget(self.ip_label)
+
+        # 多网卡时可手动切换，但默认不打扰用户
+        self.ip_combo = QComboBox()
+        self.ip_combo.addItems(get_lan_ips())
+        self.ip_combo.setCurrentText(self.lan_ip)
+        self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
+        info_layout.addWidget(self.ip_combo)
 
         self.status_label = QLabel("手机未连接")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -522,6 +515,103 @@ class LanChatWindow(QMainWindow):
         self.server_info_toggle.setText(f"📡 服务器信息 {arrow}")
 
     # ================================================================
+    # 服务 / 网络状态（保证"随时能连上"）
+    # ================================================================
+
+    def _on_server_status(self, alive, port, message):
+        if port:
+            self.current_port = port
+        self._service_alive = alive
+        if hasattr(self, 'discovery'):
+            self.discovery.set_endpoint(self.lan_ip, self.current_port)
+        self.update_qr_and_ip()
+        self._refresh_status_label()
+        if message and not alive:
+            self.add_message(f"⚠️ {message}", 'system')
+
+    def _sync_server_status(self):
+        """启动竞态兜底：服务状态信号早于 UI 构造时，主动读一次实际端口。"""
+        if srv.RUNTIME_PORT != self.current_port:
+            self.current_port = srv.RUNTIME_PORT
+            self.update_qr_and_ip()
+            if hasattr(self, 'discovery'):
+                self.discovery.set_endpoint(self.lan_ip, self.current_port)
+
+    def _check_network(self):
+        ips = get_lan_ips()
+        if (self.ip_combo.count() != len(ips)
+                or any(self.ip_combo.itemText(i) != ip for i, ip in enumerate(ips))):
+            self.ip_combo.blockSignals(True)
+            self.ip_combo.clear()
+            self.ip_combo.addItems(ips)
+            self.ip_combo.setCurrentText(self.lan_ip)
+            self.ip_combo.blockSignals(False)
+        if self.lan_ip not in ips:
+            self._set_lan_ip(ips[0])
+        self._sync_server_status()
+
+    def _on_ip_changed(self, ip):
+        if not ip or ip == self.lan_ip or not hasattr(self, 'discovery'):
+            return
+        self._set_lan_ip(ip)
+
+    def _set_lan_ip(self, ip):
+        self.lan_ip = ip
+        self.update_qr_and_ip()
+        self.discovery.set_endpoint(self.lan_ip, self.current_port)
+        self.add_message(f"网络地址已切换为 {ip}", 'system')
+
+    # ================================================================
+    # 后台传输（进度 / 取消）
+    # ================================================================
+
+    def _start_transfer(self, worker):
+        self._cancel_event = threading.Event()
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setVisible(True)
+        self.statusBar().showMessage("准备传输…")
+
+        def run():
+            try:
+                worker(self._cancel_event)
+            except Exception as e:
+                signal_emitter.system_message.emit(f"传输失败: {e}")
+            finally:
+                signal_emitter.send_progress.emit('', 0, 0)
+
+        threading.Thread(target=run, daemon=True, name='FileTransfer').start()
+
+    def _on_send_progress(self, label, done, total):
+        if not label:
+            self.cancel_btn.setVisible(False)
+            self._cancel_event = None
+            self.statusBar().clearMessage()
+            return
+        if total:
+            pct = min(100, done * 100 // total)
+            self.statusBar().showMessage(
+                f"{label}  {pct}%  ({format_size(done)}/{format_size(total)})")
+        else:
+            self.statusBar().showMessage(f"{label}  {done}")
+
+    def _cancel_transfer(self):
+        if self._cancel_event:
+            self._cancel_event.set()
+            self.cancel_btn.setEnabled(False)
+            self.statusBar().showMessage("正在取消…")
+
+    def _emit_to_phone(self, event, payload, device):
+        sid = device.get('sid')
+        if not sid:
+            return False
+        try:
+            srv.socketio.emit(event, payload, to=sid)
+            return True
+        except Exception as e:
+            signal_emitter.system_message.emit(f"发送到手机失败: {e}")
+            return False
+
+    # ================================================================
     # 设备列表管理
     # ================================================================
 
@@ -539,8 +629,7 @@ class LanChatWindow(QMainWindow):
                 self.current_chat_key = None
                 self._show_placeholder()
             del self.devices[key]
-            if key in self.chat_history:
-                del self.chat_history[key]
+            # 保留聊天历史：手机锁屏重连、PC 短暂离线后回来仍能看到记录
             self._refresh_device_list()
 
     def _refresh_device_list(self):
@@ -577,16 +666,16 @@ class LanChatWindow(QMainWindow):
                 item.setForeground(QColor('#6c5ce7'))
                 self.device_list.addItem(item)
 
-    def _on_device_connected(self, sid, device_type, display_name):
-        """手机设备连接"""
+    def _on_device_connected(self, key, device_type, display_name, sid=''):
+        """设备上线（手机 key 为稳定设备 ID，sid 用于定向投递）"""
         if device_type == 'pc':
             return  # PC 设备由 UDP 发现管理，避免重复
-        self._add_device_to_list(sid, device_type, display_name, sid=sid)
+        self._add_device_to_list(key, device_type, display_name, sid=sid or key)
         self._update_phone_status()
 
-    def _on_device_disconnected(self, sid):
-        """手机设备断开"""
-        self._remove_device_from_list(sid)
+    def _on_device_disconnected(self, key):
+        """设备确认离线（宽限期结束后才触发）"""
+        self._remove_device_from_list(key)
         self._update_phone_status()
 
     def _on_pc_device_found(self, device_info):
@@ -642,7 +731,7 @@ class LanChatWindow(QMainWindow):
             self.pc_client.disconnect()
             self.pc_client = None
 
-        self.pc_client = PCClient(target_ip, target_port)
+        self.pc_client = PCClient(target_ip, target_port, own_ip=self.lan_ip)
         self.pc_client.connected.connect(self._on_pc_connected)
         self.pc_client.disconnected.connect(self._on_pc_disconnected)
         self.pc_client.text_received.connect(self._on_pc_text_received)
@@ -671,7 +760,7 @@ class LanChatWindow(QMainWindow):
             self.pc_client = None
 
         # 建立新连接
-        self.pc_client = PCClient(target_ip, target_port)
+        self.pc_client = PCClient(target_ip, target_port, own_ip=self.lan_ip)
         self.pc_client.connected.connect(self._on_pc_connected)
         self.pc_client.disconnected.connect(self._on_pc_disconnected)
         self.pc_client.text_received.connect(self._on_pc_text_received)
@@ -738,6 +827,7 @@ class LanChatWindow(QMainWindow):
     @staticmethod
     def _build_bubble_html(content, source, is_file=False, timestamp=""):
         """构造单条消息的 HTML 气泡"""
+        safe = html.escape(str(content))  # 内容一律转义，防止对端注入 HTML
         ts_html = ""
         if timestamp:
             ts_html = f'<div style="font-size: 10px; color: #b2bec3; margin-top: 2px;">{timestamp}</div>'
@@ -745,7 +835,7 @@ class LanChatWindow(QMainWindow):
         if source == 'system':
             return (
                 f'<div style="text-align: center; margin: 6px 0;">'
-                f'<span style="font-size: 11px; color: #b2bec3;">{content}</span>'
+                f'<span style="font-size: 11px; color: #b2bec3;">{safe}</span>'
                 f'{ts_html}'
                 f'</div>'
             )
@@ -773,9 +863,9 @@ class LanChatWindow(QMainWindow):
             link_color = "#0984e3"
 
         if is_file:
-            inner = f'📎 <a style="color: {link_color}; text-decoration: underline;" href="#">{content}</a>'
+            inner = f'📎 <a style="color: {link_color}; text-decoration: underline;" href="#">{safe}</a>'
         else:
-            inner = content.replace("\n", "<br>")
+            inner = safe.replace("\n", "<br>")
 
         return (
             f'<div style="text-align: {align}; margin: 5px 0;">'
@@ -788,9 +878,9 @@ class LanChatWindow(QMainWindow):
             f'</div>'
         )
 
-    def _on_phone_text_source(self, sid):
-        """记录最近收到手机消息的来源 SID"""
-        self._last_phone_sid = sid
+    def _on_phone_text_source(self, key):
+        """记录最近收到手机消息的设备 key"""
+        self._last_phone_key = key
 
     def _find_pc_device_key(self, content):
         """从远程 PC 消息内容 [PC_Name] 中提取 PC 名，返回对应的设备 key（IP）"""
@@ -804,7 +894,7 @@ class LanChatWindow(QMainWindow):
                 return key
         return None
 
-    def add_message(self, content, source, is_file=False):
+    def add_message(self, content, source, is_file=False, source_key=''):
         """
         添加消息到聊天历史。
 
@@ -825,8 +915,8 @@ class LanChatWindow(QMainWindow):
                     self._append_to_history(self.current_chat_key, content, source, is_file, now_str)
 
         elif source == 'remote_pc':
-            # 远程 PC 发来的消息 —— 从内容中提取 PC 名，存入对应 PC 设备的历史
-            target_key = self._find_pc_device_key(content)
+            # 远程 PC 发来的消息 —— 优先用来源 IP 精确归属，避免主机名重名串台
+            target_key = source_key if source_key in self.devices else self._find_pc_device_key(content)
             if target_key:
                 self._append_to_history(target_key, content, source, is_file, now_str)
                 if self.current_chat_key == target_key:
@@ -838,15 +928,9 @@ class LanChatWindow(QMainWindow):
                     self._render_chat_history()
 
         elif source == 'phone':
-            # 来自手机的消息 —— 只存入来源手机的历史
-            source_sid = getattr(self, '_last_phone_sid', None)
-            target_key = None
-            if source_sid:
-                for key, info in self.devices.items():
-                    if info['type'] == 'phone' and info.get('sid') == source_sid:
-                        target_key = key
-                        break
-            if target_key:
+            # 来自手机的消息 —— 用稳定设备 key 归属，重连后仍进同一会话
+            target_key = getattr(self, '_last_phone_key', None)
+            if target_key and self.devices.get(target_key, {}).get('type') == 'phone':
                 self._append_to_history(target_key, content, source, is_file, now_str)
                 if self.current_chat_key == target_key:
                     self._render_chat_history()
@@ -882,10 +966,17 @@ class LanChatWindow(QMainWindow):
     # 连接状态
     # ================================================================
 
-    def _update_phone_status(self):
-        if self.pc_client and self.pc_client._connected:
+    def _refresh_status_label(self):
+        """服务状态 + 手机连接数一起显示，服务异常时一眼可见。"""
+        if not self._service_alive:
+            self.status_label.setText("⚠️ 服务未运行，正在自动恢复")
+            self.status_label.setStyleSheet("color: #d63031; font-weight: bold; font-size: 11px;")
             return
-        count = len(phone_sids)
+        if self.pc_client and self.pc_client._connected:
+            self.status_label.setText(f"已连接到 {self.pc_client.target_ip}")
+            self.status_label.setStyleSheet("color: #00b894; font-weight: bold; font-size: 11px;")
+            return
+        count = len(srv.phone_sids)
         if count > 0:
             self.status_label.setText(f"📱 {count} 台手机已连接")
             self.status_label.setStyleSheet("color: #00b894; font-weight: bold; font-size: 11px;")
@@ -893,28 +984,34 @@ class LanChatWindow(QMainWindow):
             self.status_label.setText("手机未连接")
             self.status_label.setStyleSheet("color: #d63031; font-weight: bold; font-size: 11px;")
 
+    def _update_phone_status(self):
+        self._refresh_status_label()
+
     def update_connection_status(self, connected):
-        if connected:
-            self.status_label.setText("📱 手机已连接")
-            self.status_label.setStyleSheet("color: #00b894; font-weight: bold; font-size: 11px;")
-        else:
-            self.status_label.setText("手机未连接")
-            self.status_label.setStyleSheet("color: #d63031; font-weight: bold; font-size: 11px;")
+        self._refresh_status_label()
 
     def update_phone_sid(self, sid):
         self.phone_sid = sid
 
+    def add_system_message(self, msg):
+        self.add_message(msg, 'system')
+
     def _on_pc_connected(self):
-        if self.pc_client:
-            self.status_label.setText(f"已连接到 {self.pc_client.target_ip}")
-            self.status_label.setStyleSheet("color: #00b894; font-weight: bold; font-size: 11px;")
+        self._refresh_status_label()
 
     def _on_pc_disconnected(self):
+        src = self.sender()
+        if src is not None and src is not self.pc_client:
+            return  # 旧连接的延迟信号，不要清掉新连接
         self.pc_client = None
-        self._update_phone_status()
+        self._refresh_status_label()
 
     def _on_pc_text_received(self, msg, sender):
         self.add_message(msg, 'remote_pc')
+
+    def _on_pc_message(self, content, source_ip):
+        """服务端带来源 IP 的 PC 消息，精确落到对应设备的会话。"""
+        self.add_message(content, 'remote_pc', source_key=source_ip)
 
     def _on_pc_file_received(self, file_id, filename):
         self.handle_received_file(file_id, filename, source_sid='pc')
@@ -936,7 +1033,7 @@ class LanChatWindow(QMainWindow):
 
     def update_qr_and_ip(self):
         lan_ip = self.lan_ip
-        port = 5000
+        port = self.current_port
         server_url = f"http://{lan_ip}:{port}"
         self.ip_label.setText(f"服务器地址: {server_url}")
 
@@ -1136,7 +1233,8 @@ class LanChatWindow(QMainWindow):
         if new_path and new_path != self.DOWNLOAD_FOLDER:
             self.DOWNLOAD_FOLDER = new_path
             self.download_path_label.setText(self.DOWNLOAD_FOLDER)
-            config = {'download_path': self.DOWNLOAD_FOLDER}
+            config = load_config()
+            config['download_path'] = self.DOWNLOAD_FOLDER
             if save_config(config):
                 self.add_message(f"下载路径已更改: {self.DOWNLOAD_FOLDER}", 'system')
             if not os.path.exists(self.DOWNLOAD_FOLDER):
@@ -1155,34 +1253,53 @@ class LanChatWindow(QMainWindow):
     def download_and_open_file(self, file_id, filename):
         try:
             import requests
-            download_url = f"http://127.0.0.1:5000/get_file/{file_id}"
-            # 确保中间目录存在（文件名可能包含路径，如 "文件夹/文件.txt"）
-            safe_filename = filename.replace('\\', '/')
-            save_path = os.path.join(self.DOWNLOAD_FOLDER, safe_filename)
+            download_url = f"http://127.0.0.1:{self.current_port}/get_file/{file_id}"
+
+            # 文件名净化：允许合法子目录（手机目录上传），但拒绝 ../ 与绝对路径
+            parts = [p for p in str(filename or '').replace('\\', '/').split('/')
+                     if p not in ('', '.', '..')]
+            rel = os.path.join(*parts) if parts else f'file_{file_id}'
+            root = os.path.abspath(self.DOWNLOAD_FOLDER)
+            save_path = os.path.abspath(os.path.join(root, rel))
+            try:
+                inside = os.path.commonpath([root, save_path]) == root
+            except ValueError:
+                inside = False
+            if not inside:
+                raise ValueError('非法文件名，已拒绝保存')
+
             save_dir = os.path.dirname(save_path)
-            if save_dir and not os.path.exists(save_dir):
+            if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
 
-            print(f"开始下载文件: {download_url} → {save_path}")
-
+            # 同名文件不丢弃，自动加序号
             if os.path.exists(save_path):
-                print(f"文件已存在: {save_path}")
-                signal_emitter.received_text.emit(f"文件已存在: {filename}", 'system')
-                return
+                base, ext = os.path.splitext(save_path)
+                i = 1
+                while os.path.exists(f'{base}_{i}{ext}'):
+                    i += 1
+                save_path = f'{base}_{i}{ext}'
 
-            # stream=True 分块写盘：恒定内存，大文件不再整体载入；timeout 放宽以适配大文件
-            response = requests.get(download_url, stream=True, timeout=(10, 300))
-            if response.status_code == 200:
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                print(f"文件下载成功: {save_path} ({os.path.getsize(save_path)} 字节)")
-                signal_emitter.received_text.emit(f"已下载: {filename}", 'system')
-            else:
-                print(f"下载失败: HTTP {response.status_code}")
-                signal_emitter.received_text.emit(
-                    f"下载失败: {filename} (HTTP {response.status_code})", 'system')
+            print(f"开始下载文件: {download_url} → {save_path}")
+            tmp_path = save_path + '.part'
+            with requests.get(download_url, stream=True, timeout=(10, 300)) as response:
+                if response.status_code != 200:
+                    signal_emitter.received_text.emit(
+                        f"下载失败: {filename} (HTTP {response.status_code})", 'system')
+                    return
+                try:
+                    with open(tmp_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                    os.replace(tmp_path, save_path)  # 原子落地，中断不留半截文件
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+            display_name = os.path.basename(save_path)
+            print(f"文件下载成功: {save_path} ({os.path.getsize(save_path)} 字节)")
+            signal_emitter.received_text.emit(f"已下载: {display_name}", 'system')
         except Exception as e:
             print(f"下载文件出错: {e}")
             signal_emitter.received_text.emit(f"下载文件出错: {str(e)}", 'system')
@@ -1191,21 +1308,17 @@ class LanChatWindow(QMainWindow):
     # 发送文本
     # ================================================================
 
-    def _get_target_keys(self):
-        """
-        获取发送目标设备列表。
-        如果已在左侧设备列表中选中某设备，直接返回该设备 key；
-        否则弹出设备选择对话框让用户选择。
-        """
-        if self.current_chat_key and self.current_chat_key in self.devices:
-            return [self.current_chat_key]
+    def _get_target_keys(self, force_dialog=False):
+        """文字默认发给当前会话；发文件时允许勾选多设备，未选中会话则默认全选。"""
+        current = self.current_chat_key if self.current_chat_key in self.devices else None
+        if current and not force_dialog:
+            return [current]
+        default_keys = [current] if current else (list(self.devices.keys()) if force_dialog else [])
 
-        dialog = DeviceSelector(self.devices, self)
+        dialog = DeviceSelector(self.devices, self, default_keys=default_keys)
         if dialog.exec_() != QDialog.Accepted:
             return None
-
-        keys = dialog.get_selected_devices()
-        return keys if keys else None
+        return dialog.get_selected_devices() or None
 
     def send_text(self):
         text = self.text_input.toPlainText().strip()
@@ -1232,7 +1345,8 @@ class LanChatWindow(QMainWindow):
 
             if device['type'] == 'phone':
                 try:
-                    socketio.server.emit('text_message', {'message': text}, room=key)
+                    srv.socketio.emit('text_message', {'message': text},
+                                      to=device.get('sid') or key)
                 except Exception as e:
                     self.add_message(f"发送到手机失败: {e}", 'system')
 
@@ -1260,7 +1374,7 @@ class LanChatWindow(QMainWindow):
             self.add_message("没有已连接的设备，无法发送文件", 'system')
             return
 
-        target_keys = self._get_target_keys()
+        target_keys = self._get_target_keys(force_dialog=True)
         if not target_keys:
             return
 
@@ -1276,7 +1390,7 @@ class LanChatWindow(QMainWindow):
             self.add_message("没有已连接的设备，无法发送文件夹", 'system')
             return
 
-        target_keys = self._get_target_keys()
+        target_keys = self._get_target_keys(force_dialog=True)
         if not target_keys:
             return
 
@@ -1287,138 +1401,144 @@ class LanChatWindow(QMainWindow):
     # ================================================================
 
     def _send_file_to_targets(self, file_paths, target_keys):
-        """
-        将文件列表发送到指定设备列表。
+        """手机只发链接（瞬时），PC 分片上传放后台线程，界面不再假死。"""
+        devices = [self.devices.get(k) for k in target_keys]
+        phone_devices = [d for d in devices if d and d['type'] == 'phone']
+        pc_devices = [d for d in devices if d and d['type'] == 'pc']
+        if len(pc_devices) > 1:
+            self.add_message("提示：当前版本一次仅向首个 PC 目标发送", 'system')
 
-        target_keys 中的 key 可能是手机 SID 或 PC 的 IP。
-        手机通过 socketio 广播，PC 通过 pc_client 发送。
-        """
-        file_count = len(file_paths)
-        self.add_message(f"📎 正在发送 {file_count} 个文件...", 'pc')
+        # 连接握手留在 UI 线程（短），实际上传在后台
+        pc_client = None
+        if pc_devices:
+            if not (self.pc_client and self.pc_client._connected
+                    and self.pc_client.target_ip == pc_devices[0].get('ip', '')):
+                if not self._ensure_pc_connection(pc_devices[0]):
+                    pc_devices = []
+            if pc_devices:
+                pc_client = self.pc_client
 
-        success_count = 0
+        self.add_message(f"📎 正在发送 {len(file_paths)} 个文件...", 'pc')
+        jobs = []
         for file_path in file_paths:
             filename = os.path.basename(file_path)
             file_id = str(uuid.uuid4())[:8]
-            temp_downloads[file_id] = (filename, file_path)
-            download_url = f"http://{self.lan_ip}:5000/download/{file_id}"
+            srv.temp_downloads[file_id] = (filename, file_path)
+            download_url = f"http://{self.lan_ip}:{self.current_port}/download/{file_id}"
+            for device in phone_devices:
+                if self._emit_to_phone('file_download',
+                                       {'url': download_url, 'filename': filename},
+                                       device):
+                    self.add_message(f"📎 已发送: {filename}", 'pc', is_file=True)
+            if pc_client:
+                jobs.append((file_path, pc_client, filename))
 
-            sent_any = False
+        if jobs:
+            self._start_transfer(lambda cancel: self._run_pc_uploads(jobs, cancel))
 
-            for key in target_keys:
-                device = self.devices.get(key)
-                if not device:
-                    continue
+    def _run_pc_uploads(self, jobs, cancel_event):
+        total = len(jobs)
+        for idx, (file_path, client, filename) in enumerate(jobs, 1):
+            if cancel_event.is_set():
+                signal_emitter.system_message.emit("传输已取消")
+                return
+            label = f"发往 {client.target_ip} ({idx}/{total}) {filename}"
 
-                if device['type'] == 'phone':
-                    # 发送到手机（SocketIO）
-                    try:
-                        socketio.server.emit(
-                            'file_download',
-                            {'url': download_url, 'filename': filename},
-                            room=key
-                        )
-                        sent_any = True
-                    except Exception as e:
-                        self.add_message(f"发送文件到手机失败 {filename}: {e}", 'system')
+            def progress(done, all_bytes, _label=label):
+                signal_emitter.send_progress.emit(_label, done, all_bytes)
 
-                elif device['type'] == 'pc':
-                    # 发送到 PC（自动连接）
-                    if not (self.pc_client and self.pc_client._connected
-                            and self.pc_client.target_ip == device.get('ip', '')):
-                        if not self._ensure_pc_connection(device):
-                            continue
-                    try:
-                        self.pc_client.send_file(file_path)
-                        sent_any = True
-                    except Exception as e:
-                        self.add_message(f"发送文件到 PC 失败 {filename}: {e}", 'system')
-
-            if sent_any:
-                success_count += 1
-                self.add_message(f"📎 已发送: {filename}", 'pc', is_file=True)
-
-        self.add_message(f"✅ 已发送 {success_count}/{file_count} 个文件", 'pc')
+            try:
+                client.send_file(file_path, progress_cb=progress,
+                                 cancel_event=cancel_event)
+                signal_emitter.system_message.emit(f"✅ 已发送到 PC: {filename}")
+            except Exception as e:
+                signal_emitter.system_message.emit(f"发送文件到 PC 失败 {filename}: {e}")
 
     def _send_folder_to_targets(self, folder_path, target_keys):
-        """
-        将文件夹压缩后发送到指定设备列表。
-        """
+        """压缩与发送都在后台线程，压缩进度通过状态栏反馈。"""
         folder_name = os.path.basename(folder_path)
-        self.add_message(f"📁 正在压缩文件夹: {folder_name}...", 'pc')
+        devices = [self.devices.get(k) for k in target_keys]
+        phone_devices = [d for d in devices if d and d['type'] == 'phone']
+        pc_devices = [d for d in devices if d and d['type'] == 'pc']
 
-        try:
-            temp_dir = tempfile.gettempdir()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            zip_filename = f"{folder_name}_{timestamp}.zip"
-            zip_path = os.path.join(temp_dir, zip_filename)
+        pc_client = None
+        if pc_devices:
+            if not (self.pc_client and self.pc_client._connected
+                    and self.pc_client.target_ip == pc_devices[0].get('ip', '')):
+                if not self._ensure_pc_connection(pc_devices[0]):
+                    pc_devices = []
+            if pc_devices:
+                pc_client = self.pc_client
 
-            file_count = 0
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(folder_path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, folder_path)
-                        zipf.write(file_path, arcname)
-                        file_count += 1
+        self.add_message(f"📁 正在准备文件夹: {folder_name}（后台压缩）...", 'pc')
 
-            _temp_zip_files.add(zip_path)
+        def worker(cancel_event):
+            zip_path = None
+            try:
+                temp_dir = tempfile.gettempdir()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                zip_filename = f"{folder_name}_{timestamp}.zip"
+                zip_path = os.path.join(temp_dir, zip_filename)
 
-            zip_size = os.path.getsize(zip_path)
-            size_str = format_size(zip_size)
+                file_count = 0
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(folder_path):
+                        if cancel_event.is_set():
+                            raise RuntimeError("传输已取消")
+                        for name in files:
+                            fp = os.path.join(root, name)
+                            zipf.write(fp, os.path.relpath(fp, folder_path))
+                            file_count += 1
+                            if file_count % 20 == 0:
+                                signal_emitter.send_progress.emit(
+                                    f"正在压缩 {folder_name}", file_count, 0)
+                if cancel_event.is_set():
+                    raise RuntimeError("传输已取消")
 
-            self.add_message(f"📦 压缩完成: {file_count} 个文件, 大小: {size_str}", 'pc')
+                srv._temp_zip_files.add(zip_path)
+                zip_size = os.path.getsize(zip_path)
+                signal_emitter.system_message.emit(
+                    f"📦 压缩完成: {file_count} 个文件, {format_size(zip_size)}")
 
-            file_id = str(uuid.uuid4())[:8]
-            temp_downloads[file_id] = (zip_filename, zip_path)
-            download_url = f"http://{self.lan_ip}:5000/download/{file_id}"
+                file_id = str(uuid.uuid4())[:8]
+                srv.temp_downloads[file_id] = (zip_filename, zip_path)
+                download_url = f"http://{self.lan_ip}:{self.current_port}/download/{file_id}"
+                for device in phone_devices:
+                    self._emit_to_phone('file_download',
+                                        {'url': download_url, 'filename': zip_filename},
+                                        device)
 
-            sent_any = False
+                if pc_client:
+                    def progress(done, all_bytes):
+                        signal_emitter.send_progress.emit(
+                            f"发往 {pc_client.target_ip}: {zip_filename}", done, all_bytes)
 
-            for key in target_keys:
-                device = self.devices.get(key)
-                if not device:
-                    continue
-
-                if device['type'] == 'phone':
+                    pc_client.send_file(zip_path, progress_cb=progress,
+                                        cancel_event=cancel_event)
+                    signal_emitter.system_message.emit(
+                        f"✅ 文件夹已发送到 PC: {pc_client.target_ip}")
+            except Exception as e:
+                if zip_path and os.path.exists(zip_path) and '已取消' in str(e):
                     try:
-                        socketio.server.emit(
-                            'file_download',
-                            {'url': download_url, 'filename': zip_filename},
-                            room=key
-                        )
-                        sent_any = True
-                    except Exception as e:
-                        self.add_message(f"发送文件夹到手机失败: {e}", 'system')
+                        os.remove(zip_path)
+                    except OSError:
+                        pass
+                signal_emitter.system_message.emit(f"发送文件夹失败: {e}")
 
-                elif device['type'] == 'pc':
-                    if not (self.pc_client and self.pc_client._connected
-                            and self.pc_client.target_ip == device.get('ip', '')):
-                        if not self._ensure_pc_connection(device):
-                            continue
-                    try:
-                        self.pc_client.send_file(zip_path)
-                        sent_any = True
-                    except Exception as e:
-                        self.add_message(f"发送文件夹到 PC 失败: {e}", 'system')
-
-            if sent_any:
-                self.add_message(f"📎 已发送文件夹: {folder_name}.zip ({size_str})", 'pc', is_file=True)
-            else:
-                self.add_message("❌ 文件夹发送失败", 'pc')
-        except Exception as e:
-            self.add_message(f"发送文件夹失败: {e}", 'system')
+        self._start_transfer(worker)
 
     # ================================================================
     # 关闭
     # ================================================================
 
     def closeEvent(self, event):
+        if self._cancel_event:
+            self._cancel_event.set()
+        self._net_timer.stop()
         if self.discovery:
             self.discovery.stop()
         if self.pc_client:
             self.pc_client.disconnect()
             self.pc_client = None
-        from app.server import cleanup_temp_files
-        cleanup_temp_files()
-        os._exit(0)
+        srv.cleanup_temp_files()
+        event.accept()  # 正常退出，让 atexit 完成分片目录清理

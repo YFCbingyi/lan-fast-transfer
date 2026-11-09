@@ -1,8 +1,19 @@
 import os
+import sys
 import json
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
+
+def _config_dir():
+    # 打包后配置写在 exe 同目录；源码运行时写在项目根目录。
+    # 避免 onefile 模式下写进 _MEIPASS 临时目录，退出即丢失。
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+CONFIG_FILE = os.path.join(_config_dir(), 'config.json')
 DEFAULT_DOWNLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "LanChatDownloads")
+
 
 def load_config():
     config = {
@@ -16,6 +27,7 @@ def load_config():
         except Exception as e:
             print(f"加载配置文件失败: {e}")
     return config
+
 
 def save_config(config):
     try:

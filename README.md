@@ -17,16 +17,16 @@
 
 ### 前置条件
 
-运行前请确保已安装以下依赖：
-
-```bash
-pip install flask flask-socketio gevent qrcode Pillow requests PyQt5
-```
-
-或者使用 requirements.txt：
+推荐直接使用依赖清单（含 PC 互联所需的 WebSocket 客户端）：
 
 ```bash
 pip install -r requirements.txt
+```
+
+如需手动安装：
+
+```bash
+pip install flask flask-socketio python-socketio python-engineio simple-websocket websocket-client gevent qrcode Pillow requests PyQt5
 ```
 
 ### 运行方式
@@ -40,6 +40,8 @@ python main.py --download-path D:/Downloads
 ```
 
 ### 使用步骤
+
+程序默认监听 5000 端口；若被占用会自动顺延到下一个可用端口，二维码与广播地址同步更新，无需手动配置。换 Wi-Fi、插网线后也会自动复检并刷新。
 
 1. **启动程序**：运行 `main.py`，程序会自动启动本地服务器
 2. **连接手机**：
@@ -109,6 +111,7 @@ app/                 # 核心模块
 - ✅ 不收集、不窃取用户隐私信息
 - ✅ 不监控、不记录用户剪贴板内容
 - ✅ 无后台运行、无隐蔽数据传输
+- ⚠️ 为保持「扫码即连」，默认不做密码校验：同一 Wi-Fi 内、知道地址的设备可访问页面与已发出的文件链接，请在可信网络中使用
 
 ## ⚠️ 免责声明
 

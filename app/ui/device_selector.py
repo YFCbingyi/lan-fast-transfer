@@ -9,9 +9,10 @@ from PyQt5.QtGui import QColor
 class DeviceSelector(QDialog):
     """设备选择对话框，支持多选设备后发送文件/文件夹"""
 
-    def __init__(self, devices, parent=None):
+    def __init__(self, devices, parent=None, default_keys=None):
         """
         :param devices: dict, 格式同 self.devices = {key: {'type': str, 'display_name': str, ...}}
+        :param default_keys: 默认勾选的设备 key（通常是当前聊天对象）
         """
         super().__init__(parent)
         self.setWindowTitle("选择目标设备")
@@ -75,6 +76,7 @@ class DeviceSelector(QDialog):
                 self._add_section_header("📱 手机设备")
                 for key, info in phone_items:
                     cb = QCheckBox(info['display_name'])
+                    cb.setChecked(key in (default_keys or []))
                     cb.setStyleSheet(f"color: #0984e3; font-size: 13px;")
                     self._checkboxes[key] = cb
                     self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, cb)
@@ -83,6 +85,7 @@ class DeviceSelector(QDialog):
                 self._add_section_header("🖥️ PC 设备")
                 for key, info in pc_items:
                     cb = QCheckBox(info['display_name'])
+                    cb.setChecked(key in (default_keys or []))
                     cb.setStyleSheet(f"color: #6c5ce7; font-size: 13px;")
                     self._checkboxes[key] = cb
                     self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, cb)
@@ -149,6 +152,10 @@ class DeviceSelector(QDialog):
         btn_layout.addWidget(self.cancel_btn)
         layout.addLayout(btn_layout)
 
+        if self._checkboxes and all(cb.isChecked() for cb in self._checkboxes.values()):
+            self._all_selected = True
+            self.select_all_btn.setText("取消全选")
+
     def _add_section_header(self, text):
         """添加分组标题"""
         lbl = QLabel(text)
@@ -156,11 +163,12 @@ class DeviceSelector(QDialog):
         self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, lbl)
 
     def _on_select_all(self):
-        """全选/取消全选切换"""
+        """全选 / 取消全选切换"""
         all_checked = all(cb.isChecked() for cb in self._checkboxes.values())
         for cb in self._checkboxes.values():
             cb.setChecked(not all_checked)
-        self._all_selected = True
+        self._all_selected = not all_checked
+        self.select_all_btn.setText("取消全选" if self._all_selected else "全选")
 
     def get_selected_devices(self):
         """返回选中的设备 ID 列表"""
