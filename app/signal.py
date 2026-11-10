@@ -6,7 +6,7 @@ class SignalEmitter(QObject):
     received_file = pyqtSignal(str, str, str)
     phone_connected = pyqtSignal(bool)
     phone_sid_updated = pyqtSignal(str)
-    device_connected = pyqtSignal(str, str, str, str)  # (设备 key, 类型, 显示名, 当前 sid)
+    device_connected = pyqtSignal(str, str, str, str, str)  # (设备 key, 类型, 显示名, 当前 sid, 来源 IP)
     device_disconnected = pyqtSignal(str)              # 设备 key
     device_list_updated = pyqtSignal(object)
     phone_text_key = pyqtSignal(str)                   # 手机消息来源设备 key

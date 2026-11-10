@@ -14,6 +14,7 @@ import engineio.async_drivers.gevent
 
 from app.config import load_config, DEFAULT_DOWNLOAD_FOLDER
 from app.signal import signal_emitter
+from app.ui.theme import apply_phone_tokens
 
 config = load_config()
 
@@ -41,6 +42,7 @@ phone_sids = set()                 # 当前在线手机 sid
 phone_device_ids = {}             # sid -> 稳定设备 ID（浏览器 localStorage）
 device_id_sids = {}               # 稳定设备 ID -> 当前 sid
 pc_sids = {}                      # sid -> {'name', 'ip'}
+client_ips = {}                   # sid -> 握手来源 IP
 _temp_zip_files = set()
 
 RUNTIME_PORT = 5000               # 实际监听端口（被占用时自动顺延）
@@ -66,60 +68,19 @@ PHONE_PAGE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>局域网文件/消息传输</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-               background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-               height: 100vh; display: flex; justify-content: center; align-items: center; }
-        .container { width: 90%; max-width: 400px; background: white; border-radius: 20px;
-                     box-shadow: 0 10px 40px rgba(0,0,0,0.3); overflow: hidden;
-                     display: flex; flex-direction: column; height: 80vh; }
-        .header { background: #6c5ce7; color: white; padding: 15px; text-align: center;
-                  font-size: 18px; font-weight: bold; letter-spacing: 1px; display: flex; align-items: center; justify-content: space-between; }
-        .messages { flex: 1; padding: 15px; overflow-y: auto; background: #f8f9fa;
-                    display: flex; flex-direction: column; }
-        .msg { margin-bottom: 10px; max-width: 80%; word-wrap: break-word; }
-        .msg.local { align-self: flex-end; background: #6c5ce7; color: white;
-                     border-radius: 15px 15px 0 15px; padding: 10px; }
-        .msg.remote { align-self: flex-start; background: white; border: 1px solid #ddd;
-                      border-radius: 15px 15px 15px 0; padding: 10px; }
-        .file-link { color: #6c5ce7; text-decoration: underline; cursor: pointer; }
-        .input-area { display: flex; padding: 10px; background: white; border-top: 1px solid #ddd; }
-        #textInput { flex: 1; border: none; outline: none; font-size: 16px; padding: 8px;
-                     border-radius: 20px; background: #f1f3f5; }
-        button { background: #6c5ce7; color: white; border: none; border-radius: 20px;
-                 padding: 8px 15px; margin-left: 5px; font-size: 14px; cursor: pointer; }
-        button:active { opacity: 0.8; }
-        #fileInput { display: none; }
-        .status { text-align: center; color: #777; font-size: 12px; padding: 5px; }
-        .progress-container { width: 100%; background-color: #e0e0e0; border-radius: 5px; height: 8px; margin-top: 5px; }
-        .progress-bar { height: 100%; background-color: #00b894; border-radius: 5px; transition: width 0.3s ease; }
-        .upload-status { font-size: 12px; color: #666; }
-        .about-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
-        .about-content { background: white; width: 90%; max-width: 350px; border-radius: 15px; padding: 20px; max-height: 85vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-        .about-title { font-size: 18px; font-weight: bold; text-align: center; color: #2d3436; margin-bottom: 5px; position: sticky; top: 0; background: white; padding-bottom: 10px; }
-        .about-version { font-size: 12px; color: #636e72; text-align: center; margin-bottom: 15px; }
-        .about-section { margin: 15px 0; }
-        .about-section-title { font-size: 14px; font-weight: bold; color: #2d3436; margin-bottom: 8px; }
-        .about-text { font-size: 12px; color: #636e72; line-height: 1.6; }
-        .privacy-box { background: #f8f9fa; padding: 10px; border-radius: 8px; border-left: 3px solid #00b894; }
-        .disclaimer-box { background: #fff8e6; padding: 10px; border-radius: 8px; border-left: 3px solid #ffc107; }
-        .about-close { width: 100%; padding: 12px; background: #6c5ce7; color: white; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; margin-top: 15px; position: sticky; bottom: 0; }
-        .about-close:active { background: #5a4bd1; }
-        .input-area { position: relative; }
-        .popup-menu { display: none; position: absolute; bottom: 60px; right: 10px; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); overflow: hidden; z-index: 10; }
-        .popup-menu.show { display: block; }
-        .popup-item { padding: 12px 20px; font-size: 15px; cursor: pointer; white-space: nowrap; border: none; background: none; width: 100%; text-align: left; color: #2d3436; }
-        .popup-item:hover { background: #f5f5f5; }
-        .popup-item:first-child { border-bottom: 1px solid #eee; }
-        .popup-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 9; }
-    </style>
+    <style>/*__PHONE_CSS__*/</style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <span style="flex: 1; text-align: center;">📡 局域网传输</span>
-            <span style="font-size: 14px; color: white; cursor: pointer; padding: 0 10px;" onclick="showAbout()">ℹ️ 关于</span>
+            <div class="brand">
+                <span class="brand-mark">__ICON_LOGO__</span>
+                <div>
+                    <div class="brand-name">局域网传输</div>
+                    <div class="brand-sub">本地网络 · 无需互联网</div>
+                </div>
+            </div>
+            <button class="icon-btn icon-about" onclick="showAbout()" aria-label="关于">__ICON_INFO__关于</button>
         </div>
         <div class="messages" id="messages">
             <div class="status">等待连接...</div>
@@ -127,40 +88,40 @@ PHONE_PAGE = """
         <div class="input-area">
             <input type="text" id="textInput" placeholder="输入文字..." autocomplete="off">
             <button id="sendBtn" onclick="sendText()" style="display:none">发送</button>
-            <button id="plusBtn" onclick="togglePopup()">+</button>
+            <button id="plusBtn" onclick="togglePopup()" aria-label="添加">__ICON_PLUS__</button>
             <div class="popup-overlay" id="popupOverlay" onclick="hidePopup()"></div>
             <div class="popup-menu" id="popupMenu">
-                <button class="popup-item" onclick="document.getElementById('fileInput').click();hidePopup()">📎 发送文件</button>
-                <button class="popup-item" onclick="document.getElementById('dirInput').click();hidePopup()">📁 发送文件夹</button>
+                <button class="popup-item" onclick="document.getElementById('fileInput').click();hidePopup()">__ICON_FILE__发送文件</button>
+                <button class="popup-item" onclick="document.getElementById('dirInput').click();hidePopup()">__ICON_FOLDER__发送文件夹</button>
             </div>
             <input type="file" id="dirInput" webkitdirectory style="display:none" onchange="sendDirectory(this.files)">
             <input type="file" id="fileInput" onchange="sendFiles(this.files)" multiple>
         </div>
     </div>
-    
+
     <div class="about-modal" id="aboutModal">
         <div class="about-content">
-            <div class="about-title">📡 局域网双向传输</div>
+            <div class="about-title">__ICON_LOGO_LIGHT__局域网双向传输</div>
             <div class="about-version">版本 v2.0</div>
-            
+
             <div class="about-section">
-                <div class="about-section-title">🔧 简介</div>
+                <div class="about-section-title">__ICON_INFO_SECTION__简介</div>
                 <div class="about-text">
-                    一款简洁高效的局域网文件传输工具，支持电脑与手机之间的实时消息和文件互传。
+                    一款简洁高效的局域网文件传输工具，支持电脑与移动设备之间的实时消息和文件互传。
                 </div>
             </div>
-            
+
             <div class="about-section">
-                <div class="about-section-title">✨ 特性</div>
+                <div class="about-section-title">__ICON_SPARKLE_SECTION__特性</div>
                 <div class="about-text">
                     • 本地局域网传输，无需互联网<br>
                     • 支持大文件高速传输<br>
                     • 实时消息和文件互传
                 </div>
             </div>
-            
+
             <div class="about-section">
-                <div class="about-section-title">🔒 隐私与安全</div>
+                <div class="about-section-title">__ICON_SHIELD_SECTION__隐私与安全</div>
                 <div class="about-text privacy-box">
                     ✓ 仅在本地局域网内传输数据<br>
                     ✓ 不上传数据到远程服务器<br>
@@ -168,14 +129,14 @@ PHONE_PAGE = """
                     ✓ 不监控剪贴板内容
                 </div>
             </div>
-            
+
             <div class="about-section">
-                <div class="about-section-title">⚠️ 免责声明</div>
+                <div class="about-section-title">__ICON_ALERT_SECTION__免责声明</div>
                 <div class="about-text disclaimer-box">
                     本软件为个人免费工具，仅供个人非商业用途使用。作者不对使用本软件造成的任何直接或间接损失负责。
                 </div>
             </div>
-            
+
             <button class="about-close" onclick="hideAbout()">关闭</button>
         </div>
     </div>
@@ -189,11 +150,17 @@ PHONE_PAGE = """
         const UPLOAD_PARALLEL = 2;          // 每个文件并行分片数
         const MAX_FILE_PARALLEL = 3;        // 同时上传的文件数上限，避免目录上传压垮服务端
 
-        // 稳定设备 ID：锁屏/切后台/换网络重连后仍是同一台设备，聊天记录不会丢
-        let deviceId = localStorage.getItem('lft_device_id');
-        if (!deviceId) {
+        // 稳定设备 ID：锁屏/切后台/换网络重连后仍是同一台设备，聊天记录不会丢。
+        // 隐私模式或 WebView 禁用 localStorage 时退化为会话内 ID，保证页面功能仍可用。
+        let deviceId = null;
+        try {
+            deviceId = localStorage.getItem('lft_device_id');
+            if (!deviceId) {
+                deviceId = 'p-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+                localStorage.setItem('lft_device_id', deviceId);
+            }
+        } catch (e) {
             deviceId = 'p-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
-            localStorage.setItem('lft_device_id', deviceId);
         }
 
         socket.on('connect', () => {
@@ -229,7 +196,10 @@ PHONE_PAGE = """
             const link = document.createElement('a');
             link.className = 'file-link';
             link.href = url.href;
-            link.textContent = '📁 ' + (data.filename || '文件');
+            link.innerHTML = '__ICON_FILE_16__';
+            const label = document.createElement('span');
+            label.textContent = data.filename || '文件';
+            link.appendChild(label);
             link.setAttribute('download', data.filename || '');
             addMessage(link, 'remote');
         });
@@ -358,7 +328,7 @@ PHONE_PAGE = """
             sizeSpan.id = sizeId;
             sizeSpan.textContent = '0';
             statusDiv.appendChild(sizeSpan);
-            statusDiv.appendChild(document.createTextNode(`/${formatSize(file.size})`));
+            statusDiv.appendChild(document.createTextNode(`/${formatSize(file.size)}`));
             messagesDiv.appendChild(statusDiv);
 
             const progressContainer = document.createElement('div');
@@ -558,13 +528,13 @@ PHONE_PAGE = """
         }
         
         function showAbout() {
-            document.getElementById('aboutModal').style.display = 'flex';
+            document.getElementById('aboutModal').classList.add('is-open');
         }
-        
+
         function hideAbout() {
-            document.getElementById('aboutModal').style.display = 'none';
+            document.getElementById('aboutModal').classList.remove('is-open');
         }
-        
+
         document.getElementById('aboutModal').addEventListener('click', (e) => {
             if (e.target === document.getElementById('aboutModal')) {
                 hideAbout();
@@ -574,6 +544,10 @@ PHONE_PAGE = """
 </body>
 </html>
 """
+
+# CSS / 线性图标 / 旧状态文案统一由视觉令牌注入，服务端只保留页面结构与协议逻辑
+PHONE_PAGE = apply_phone_tokens(PHONE_PAGE)
+
 
 @app.route('/')
 def index():
@@ -788,16 +762,36 @@ def get_file(file_id):
         return stream_file_response(filepath, os.path.basename(filepath))
     return "文件不存在", 404
 
+def _client_ip(req):
+    """从 Socket.IO 上下文取来源 IP（仅用于界面显示，不参与访问控制）。
+
+    不同 engineio / WSGI 版本里，remote_addr 可能只存在于握手 environ 中。
+    """
+    try:
+        ip = req.remote_addr or ''
+    except Exception:
+        ip = ''
+    if not ip:
+        try:
+            ip = req.environ.get('REMOTE_ADDR', '') or ''
+        except Exception:
+            ip = ''
+    return ip
+
+
 @socketio.on('connect')
 def handle_connect():
     from flask import request
-    print('新连接, sid:', request.sid)
+    # 握手阶段记录来源 IP；事件上下文取不到时用它兜底
+    client_ips[request.sid] = _client_ip(request)
+    print('新连接, sid:', request.sid, '来源:', client_ips[request.sid])
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
     from flask import request
     sid = request.sid
+    client_ips.pop(sid, None)
 
     pc_info = pc_sids.pop(sid, None)
     if pc_info:
@@ -810,7 +804,7 @@ def handle_disconnect():
     phone_sids.discard(sid)
     device_id = phone_device_ids.pop(sid, None)
     key = device_id or sid
-    print(f'手机连接中断: {key} (进入 {GRACE_SECONDS} 秒宽限期)')
+    print(f'移动设备连接中断: {key} (进入 {GRACE_SECONDS} 秒宽限期)')
 
     def _grace_check():
         gevent.sleep(GRACE_SECONDS)
@@ -829,7 +823,7 @@ def handle_disconnect():
 
 @socketio.on('identify')
 def handle_identify(data):
-    """客户端身份识别：手机用稳定 device_id，PC 客户端带上来源 IP。"""
+    """客户端身份识别：移动设备用稳定 device_id，PC 客户端带上来源 IP。"""
     from flask import request
     data = data or {}
     sid = request.sid
@@ -841,6 +835,7 @@ def handle_identify(data):
         return
 
     device_id = str(data.get('device_id') or sid)[:64]
+    source_ip = _client_ip(request) or client_ips.get(sid, '')
     old_sid = device_id_sids.get(device_id)
     if old_sid and old_sid != sid:
         phone_sids.discard(old_sid)
@@ -849,10 +844,10 @@ def handle_identify(data):
     phone_device_ids[sid] = device_id
     phone_sids.add(sid)
 
-    print(f'手机客户端已识别: {device_id} (sid: {sid[:4]})')
+    print(f'移动设备已识别: {device_id} (来源: {source_ip})')
     signal_emitter.phone_connected.emit(True)
     signal_emitter.phone_sid_updated.emit(sid)
-    signal_emitter.device_connected.emit(device_id, 'phone', f'手机-{device_id[-4:]}', sid)
+    signal_emitter.device_connected.emit(device_id, 'phone', '移动设备', sid, source_ip)
 
 
 @socketio.on('text_message')
@@ -870,7 +865,7 @@ def handle_text_message(data):
     else:
         key = phone_device_ids.get(sid, sid)
         source_msg = f"[{key[-4:]}] {msg}"
-        print(f"收到手机文本: {source_msg}")
+        print(f"收到移动设备文本: {source_msg}")
         signal_emitter.phone_text_key.emit(key)
         signal_emitter.received_text.emit(source_msg, 'phone')
 
@@ -888,7 +883,7 @@ def handle_file_uploaded(data):
         signal_emitter.received_file.emit(file_id, filename, 'pc')
     else:
         key = phone_device_ids.get(source_sid, source_sid)
-        print(f"手机上传文件完成: {filename} (来源: {key})")
+        print(f"移动设备上传文件完成: {filename} (来源: {key})")
         signal_emitter.received_file.emit(file_id, filename, key)
 
 def cleanup_expired_sessions():

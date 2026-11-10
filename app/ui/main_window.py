@@ -12,11 +12,15 @@ from PyQt5.QtWidgets import (
     QLabel, QTextEdit, QPushButton, QFileDialog, QDialog, QScrollArea,
     QListWidget, QListWidgetItem, QSplitter, QFrame, QComboBox
 )
-from PyQt5.QtCore import Qt, QEvent, QTimer
-from PyQt5.QtGui import QPixmap, QColor, QFont
+from PyQt5.QtCore import Qt, QEvent, QTimer, QSize, QUrl
+from PyQt5.QtGui import QPixmap, QColor, QFont, QTextDocument
 import qrcode
 from io import BytesIO
 
+from app.ui.theme import DESKTOP_QSS, COLORS, reduced_motion
+from app.ui.icons import (
+    GlowButton, svg_icon, svg_pixmap, apply_theme, fade_widget, height_animation,
+)
 from app import server as srv
 from app.signal import signal_emitter
 from app.config import save_config, load_config
@@ -46,47 +50,8 @@ class LanChatWindow(QMainWindow):
         self.current_chat_key = None             # 当前选中的设备 key
         self._last_phone_key = None              # 最近收到手机消息的设备 key
 
-        # ---- 全局样式 ----
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f5f6fa;
-            }
-            QPushButton {
-                background-color: #6c5ce7;
-                color: white;
-                border: none;
-                border-radius: 20px;
-                padding: 10px 20px;
-                font-size: 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #5a4bd1;
-            }
-            QPushButton:pressed {
-                background-color: #4a3db5;
-            }
-            QTextEdit {
-                border: 1px solid #dfe6e9;
-                border-radius: 15px;
-                padding: 10px;
-                background-color: white;
-                font-size: 13px;
-            }
-            QScrollBar:vertical {
-                border: none;
-                background: #dfe6e9;
-                width: 8px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background: #b2bec3;
-                border-radius: 4px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-        """)
+        # ---- 全局样式：统一视觉令牌（桌面 QSS） ----
+        self.setStyleSheet(DESKTOP_QSS)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -95,12 +60,7 @@ class LanChatWindow(QMainWindow):
         # 主布局：QSplitter 左右分割
         # ============================================================
         self.splitter = QSplitter(Qt.Horizontal)
-        self.splitter.setHandleWidth(2)
-        self.splitter.setStyleSheet("""
-            QSplitter::handle {
-                background-color: #b2bec3;
-            }
-        """)
+        self.splitter.setHandleWidth(1)
 
         # ---- 左侧面板 ----
         self.left_panel = self._build_left_panel()
@@ -111,7 +71,7 @@ class LanChatWindow(QMainWindow):
         self.splitter.addWidget(self.right_panel)
 
         # 设置初始比例：左侧约 160px，其余给右侧
-        self.splitter.setSizes([180, 640])
+        self.splitter.setSizes([210, 770])
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
 
@@ -121,14 +81,17 @@ class LanChatWindow(QMainWindow):
 
         # ---- 底部页脚 ----
         footer_label = QLabel(
-            '<div style="text-align: center; color: #888888; font-size: 10px; padding: 1px 0;">'
+            f'<div style="text-align: center; color: {COLORS["subtle"]}; '
+            f'font-size: 10px; padding: 1px 0;">'
             '原平沐阳网络 · 开源实验室'
             '<span style="margin: 0 4px;">|</span>'
-            '更多效率工具关注公众号：<span style="font-weight: bold;">「沐阳网络干货」</span>'
+            '更多效率工具关注公众号：<span style="font-weight: 600;">「沐阳网络干货」</span>'
             '</div>'
         )
         footer_label.setFixedHeight(22)
-        footer_label.setStyleSheet("background-color: #ffffff; border-top: 1px solid #dfe6e9;")
+        footer_label.setStyleSheet(
+            f"background-color: {COLORS['surface']}; border-top: 1px solid {COLORS['border']};"
+        )
         main_layout.addWidget(footer_label)
 
         # ============================================================
@@ -176,6 +139,9 @@ class LanChatWindow(QMainWindow):
         self._show_placeholder()
         self.text_input.setFocus()
 
+        # 历史内联 QSS 统一收敛到当前视觉令牌（含状态栏按钮）
+        apply_theme(self)
+
     def _choose_lan_ip(self):
         """自动选默认路由出口 IP，启动不再弹框；需要时可在服务器信息面板手动切换。"""
         ips = get_lan_ips()
@@ -200,26 +166,22 @@ class LanChatWindow(QMainWindow):
         layout.setContentsMargins(8, 10, 8, 10)
         layout.setSpacing(8)
 
-        # ---- 顶部：标题 + 关于按钮 ----
+        # ---- 顶部：品牌 + 关于按钮（线性图标，不用 emoji 作结构图标） ----
         title_row = QHBoxLayout()
-        title_label = QLabel("📡 局域网传输")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #2d3436;")
-        about_btn = QPushButton("ℹ️")
+        brand_icon = QLabel()
+        brand_icon.setPixmap(svg_pixmap('broadcast', 20, COLORS['primary']))
+        brand_icon.setFixedSize(20, 20)
+        title_label = QLabel("局域网传输")
+        title_label.setStyleSheet(f"font-size: 15px; font-weight: 600; color: {COLORS['text']};")
+        about_btn = QPushButton()
+        about_btn.setObjectName("iconOnly")
         about_btn.setFixedSize(30, 30)
-        about_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #6c5ce7;
-                border: none;
-                border-radius: 15px;
-                font-size: 16px;
-                padding: 0;
-            }
-            QPushButton:hover {
-                background-color: #f0f0ff;
-            }
-        """)
+        about_btn.setIcon(svg_icon('info', 17, COLORS['muted']))
+        about_btn.setIconSize(QSize(17, 17))
+        about_btn.setToolTip("关于")
         about_btn.clicked.connect(self.show_about_dialog)
+        title_row.addWidget(brand_icon)
+        title_row.addSpacing(8)
         title_row.addWidget(title_label)
         title_row.addStretch()
         title_row.addWidget(about_btn)
@@ -227,29 +189,20 @@ class LanChatWindow(QMainWindow):
 
         # 分隔线
         sep1 = QFrame()
+        sep1.setObjectName("sep")
         sep1.setFrameShape(QFrame.HLine)
-        sep1.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
         layout.addWidget(sep1)
 
-        # ---- 折叠服务器信息 ----
+        # ---- 折叠服务器信息（180ms 高度过渡） ----
         self._server_info_visible = False
-        self.server_info_toggle = QPushButton("📡 服务器信息 ▸")
-        self.server_info_toggle.setObjectName("serverInfoToggle")
-        self.server_info_toggle.setStyleSheet("""
-            QPushButton#serverInfoToggle {
-                background-color: #f0f0ff;
-                color: #6c5ce7;
-                border: 1px solid #dfe6e9;
-                border-radius: 8px;
-                padding: 6px 12px;
-                font-size: 12px;
-                font-weight: bold;
-                text-align: left;
-            }
-            QPushButton#serverInfoToggle:hover {
-                background-color: #e8e8ff;
-            }
-        """)
+        self._info_anim = None
+        self.server_info_toggle = GlowButton("服务器信息")
+        self.server_info_toggle.setObjectName("secondary")
+        self.server_info_toggle.setIcon(svg_icon('chevron_right', 14, COLORS['muted']))
+        self.server_info_toggle.setIconSize(QSize(14, 14))
+        self.server_info_toggle.setStyleSheet(
+            "text-align: left; padding: 6px 10px; font-size: 12px;"
+        )
         self.server_info_toggle.clicked.connect(self._toggle_server_info)
         layout.addWidget(self.server_info_toggle)
 
@@ -278,7 +231,7 @@ class LanChatWindow(QMainWindow):
         self.ip_combo.currentTextChanged.connect(self._on_ip_changed)
         info_layout.addWidget(self.ip_combo)
 
-        self.status_label = QLabel("手机未连接")
+        self.status_label = QLabel("移动设备未连接")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("color: #d63031; font-weight: bold; font-size: 11px;")
         info_layout.addWidget(self.status_label)
@@ -290,29 +243,16 @@ class LanChatWindow(QMainWindow):
         path_box_layout.setContentsMargins(6, 6, 6, 6)
         path_box_layout.setSpacing(4)
 
-        path_title = QLabel("📁 下载路径")
-        path_title.setStyleSheet("color: #2d3436; font-weight: bold; font-size: 11px;")
+        path_title = QLabel("下载路径")
+        path_title.setObjectName("sectionTitle")
 
         self.download_path_label = QLabel(self.DOWNLOAD_FOLDER)
         self.download_path_label.setStyleSheet("color: #636e72; font-size: 10px;")
         self.download_path_label.setWordWrap(True)
 
-        self.change_path_btn = QPushButton("更改")
+        self.change_path_btn = GlowButton("更改")
+        self.change_path_btn.setObjectName("secondary")
         self.change_path_btn.setFixedHeight(28)
-        self.change_path_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #00b894;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 4px 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #00a381;
-            }
-        """)
         self.change_path_btn.clicked.connect(self.change_download_path)
 
         path_box_layout.addWidget(path_title)
@@ -324,36 +264,16 @@ class LanChatWindow(QMainWindow):
 
         # 分隔线
         sep2 = QFrame()
+        sep2.setObjectName("sep")
         sep2.setFrameShape(QFrame.HLine)
-        sep2.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
         layout.addWidget(sep2)
 
         # ---- 设备列表 ----
-        device_header = QLabel("📡 设备列表")
-        device_header.setStyleSheet("color: #2d3436; font-weight: bold; font-size: 12px;")
+        device_header = QLabel("设备列表")
+        device_header.setObjectName("sectionTitle")
         layout.addWidget(device_header)
 
         self.device_list = QListWidget()
-        self.device_list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #dfe6e9;
-                border-radius: 8px;
-                background-color: #f0f1f3;
-                font-size: 12px;
-                padding: 4px;
-            }
-            QListWidget::item {
-                padding: 6px 8px;
-                border-radius: 4px;
-            }
-            QListWidget::item:hover {
-                background-color: #e8e8ff;
-            }
-            QListWidget::item:selected {
-                background-color: #6c5ce7;
-                color: white;
-            }
-        """)
         self.device_list.itemClicked.connect(self._on_device_selected)
         self.device_list.itemDoubleClicked.connect(self._on_device_double_clicked)
         layout.addWidget(self.device_list, 1)  # stretch factor 1, fills remaining space
@@ -373,49 +293,29 @@ class LanChatWindow(QMainWindow):
         self.chat_header = QLabel("请选择一个设备开始聊天")
         self.chat_header.setObjectName("chatHeader")
         self.chat_header.setAlignment(Qt.AlignCenter)
-        self.chat_header.setStyleSheet("""
-            QLabel#chatHeader {
-                font-size: 15px;
-                font-weight: bold;
-                color: #2d3436;
-                padding: 8px;
-                background-color: #f8f9fa;
-                border: 1px solid #dfe6e9;
-                border-radius: 10px;
-            }
-        """)
         layout.addWidget(self.chat_header)
 
         # 分隔线
         sep_right1 = QFrame()
+        sep_right1.setObjectName("sep")
         sep_right1.setFrameShape(QFrame.HLine)
-        sep_right1.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
         layout.addWidget(sep_right1)
 
         # ---- 聊天消息显示区 ----
         self.chat_display = QTextEdit()
+        self.chat_display.setObjectName("chatDisplay")
         self.chat_display.setReadOnly(True)
         self.chat_display.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.chat_display.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid #dfe6e9;
-                border-radius: 12px;
-                padding: 12px;
-                background-color: #fafafa;
-                font-size: 13px;
-            }
-        """)
         layout.addWidget(self.chat_display, 1)
 
         # 分隔线
         sep_right2 = QFrame()
+        sep_right2.setObjectName("sep")
         sep_right2.setFrameShape(QFrame.HLine)
-        sep_right2.setStyleSheet("background-color: #b2bec3; max-height: 1px; border: none;")
         layout.addWidget(sep_right2)
 
-        # ---- 输入区域 ----
+        # ---- 输入区域：三级按钮层级（主操作 / 次要 / 强调），统一线性图标 ----
         input_container = QWidget()
-        input_container.setStyleSheet("background-color: transparent;")
         input_layout = QHBoxLayout(input_container)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(8)
@@ -423,72 +323,20 @@ class LanChatWindow(QMainWindow):
         self.text_input = QTextEdit()
         self.text_input.setMaximumHeight(60)
         self.text_input.setPlaceholderText("输入要发送的文字...")
-        self.text_input.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid #dfe6e9;
-                border-radius: 12px;
-                padding: 8px 12px;
-                background-color: white;
-                font-size: 13px;
-            }
-        """)
 
-        self.send_text_btn = QPushButton("发送")
-        self.send_text_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #6c5ce7;
-                color: white;
-                border: none;
-                border-radius: 12px;
-                padding: 8px 16px;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #5a4bd1;
-            }
-            QPushButton:pressed {
-                background-color: #4a3db5;
-            }
-        """)
+        self.send_text_btn = GlowButton("发送")
+        self.send_text_btn.setIcon(svg_icon('chat', 16, COLORS['on_primary']))
+        self.send_text_btn.setIconSize(QSize(16, 16))
 
-        self.send_file_btn = QPushButton("📎 文件")
-        self.send_file_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0984e3;
-                color: white;
-                border: none;
-                border-radius: 12px;
-                padding: 8px 16px;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #0773c5;
-            }
-            QPushButton:pressed {
-                background-color: #0662a8;
-            }
-        """)
+        self.send_file_btn = GlowButton("文件")
+        self.send_file_btn.setObjectName("primarySoft")
+        self.send_file_btn.setIcon(svg_icon('file', 16, COLORS['primary']))
+        self.send_file_btn.setIconSize(QSize(16, 16))
 
-        self.send_folder_btn = QPushButton("📁 文件夹")
-        self.send_folder_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #fdcb6e;
-                color: #2d3436;
-                border: none;
-                border-radius: 12px;
-                padding: 8px 16px;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #f9ca24;
-            }
-            QPushButton:pressed {
-                background-color: #e1b621;
-            }
-        """)
+        self.send_folder_btn = GlowButton("文件夹")
+        self.send_folder_btn.setObjectName("accent")
+        self.send_folder_btn.setIcon(svg_icon('folder', 16, COLORS['accent']))
+        self.send_folder_btn.setIconSize(QSize(16, 16))
 
         # 按钮尺寸
         for btn in (self.send_text_btn, self.send_file_btn, self.send_folder_btn):
@@ -508,11 +356,44 @@ class LanChatWindow(QMainWindow):
     # ================================================================
 
     def _toggle_server_info(self):
-        """切换服务器信息面板的展开/折叠"""
-        self._server_info_visible = not self._server_info_visible
-        self.server_info_content.setVisible(self._server_info_visible)
-        arrow = "▾" if self._server_info_visible else "▸"
-        self.server_info_toggle.setText(f"📡 服务器信息 {arrow}")
+        """服务器信息面板展开/折叠，180ms 高度过渡（减少动效时瞬时切换）。"""
+        visible = not self._server_info_visible
+        self._server_info_visible = visible
+        widget = self.server_info_content
+        self.server_info_toggle.setIcon(
+            svg_icon('chevron_down' if visible else 'chevron_right', 14, COLORS['muted'])
+        )
+
+        if self._info_anim is not None:
+            self._info_anim.stop()
+            self._info_anim = None
+
+        if reduced_motion():
+            widget.setVisible(visible)
+            widget.setMaximumHeight(16777215 if visible else 0)
+            return
+
+        anim = height_animation(
+            widget,
+            0 if visible else widget.height(),
+            max(widget.sizeHint().height(), 1) if visible else 0,
+        )
+        anim.finished.connect(self._on_info_anim_finished)
+        if visible:
+            widget.setVisible(True)
+            widget.setMaximumHeight(0)
+        self._info_anim = anim
+        anim.start()
+
+    def _on_info_anim_finished(self):
+        if self._info_anim is None:
+            return
+        self._info_anim = None
+        widget = self.server_info_content
+        if self._server_info_visible:
+            widget.setMaximumHeight(16777215)
+        else:
+            widget.setVisible(False)
 
     # ================================================================
     # 服务 / 网络状态（保证"随时能连上"）
@@ -527,7 +408,7 @@ class LanChatWindow(QMainWindow):
         self.update_qr_and_ip()
         self._refresh_status_label()
         if message and not alive:
-            self.add_message(f"⚠️ {message}", 'system')
+            self.add_message(message, 'system')
 
     def _sync_server_status(self):
         """启动竞态兜底：服务状态信号早于 UI 构造时，主动读一次实际端口。"""
@@ -608,7 +489,7 @@ class LanChatWindow(QMainWindow):
             srv.socketio.emit(event, payload, to=sid)
             return True
         except Exception as e:
-            signal_emitter.system_message.emit(f"发送到手机失败: {e}")
+            signal_emitter.system_message.emit(f"发送到移动设备失败: {e}")
             return False
 
     # ================================================================
@@ -641,7 +522,7 @@ class LanChatWindow(QMainWindow):
         def add_section(title):
             item = QListWidgetItem(title)
             item.setFlags(Qt.NoItemFlags)
-            item.setForeground(QColor('#636e72'))
+            item.setForeground(QColor(COLORS['muted']))
             font = QFont()
             font.setBold(True)
             font.setPointSize(9)
@@ -649,28 +530,33 @@ class LanChatWindow(QMainWindow):
             self.device_list.addItem(item)
 
         if phone_items:
-            add_section("📱 手机设备")
+            add_section("移动设备")
             for key, info in phone_items:
                 item = QListWidgetItem(info['display_name'])
                 item.setData(Qt.UserRole, key)
                 item.setData(Qt.UserRole + 1, info['type'])
-                item.setForeground(QColor('#0984e3'))
+                item.setForeground(QColor(COLORS['text']))
+                item.setToolTip(
+                    f"来源 IP: {info.get('ip') or '未知'}\n设备 ID: {key[-8:]}"
+                )
                 self.device_list.addItem(item)
 
         if pc_items:
-            add_section("🖥️ PC 设备")
+            add_section("PC 设备")
             for key, info in pc_items:
                 item = QListWidgetItem(info['display_name'])
                 item.setData(Qt.UserRole, key)
                 item.setData(Qt.UserRole + 1, info['type'])
-                item.setForeground(QColor('#6c5ce7'))
+                item.setForeground(QColor(COLORS['text']))
+                item.setToolTip(f"来源 IP: {info.get('ip') or '未知'}")
                 self.device_list.addItem(item)
 
-    def _on_device_connected(self, key, device_type, display_name, sid=''):
-        """设备上线（手机 key 为稳定设备 ID，sid 用于定向投递）"""
+    def _on_device_connected(self, key, device_type, display_name, sid='', ip=''):
+        """设备上线（移动设备 key 为稳定设备 ID，sid 定向投递，ip 为浏览器来源地址）"""
         if device_type == 'pc':
             return  # PC 设备由 UDP 发现管理，避免重复
-        self._add_device_to_list(key, device_type, display_name, sid=sid or key)
+        label = f"{display_name} ({ip})" if ip else display_name
+        self._add_device_to_list(key, device_type, label, sid=sid or key, ip=ip)
         self._update_phone_status()
 
     def _on_device_disconnected(self, key):
@@ -682,7 +568,7 @@ class LanChatWindow(QMainWindow):
         """发现 PC 设备"""
         device_name = device_info.get('device_name', 'Unknown')
         ip = device_info.get('ip', '')
-        display_name = f"🖥️ {device_name} ({ip})"
+        display_name = f"{device_name} ({ip})"
         self._add_device_to_list(ip, 'pc', display_name,
                                  device_name=device_name, ip=ip,
                                  port=device_info.get('port', 5000))
@@ -775,29 +661,31 @@ class LanChatWindow(QMainWindow):
             return False
 
     def _switch_chat(self, key):
-        """切换到指定设备的聊天视图"""
+        """切换到指定设备的聊天视图（180ms 淡入过渡）"""
         self.current_chat_key = key
         device_info = self.devices.get(key)
-        if device_info:
-            self.chat_header.setText(f"💬 与 {device_info['display_name']} 聊天")
-        else:
-            self.chat_header.setText("💬 聊天")
+        self.chat_header.setText(
+            f"与 {device_info['display_name']} 聊天" if device_info else "聊天"
+        )
         self._render_chat_history()
+        fade_widget(self.chat_display)
 
     def _show_placeholder(self):
         """未选择设备时显示占位提示"""
         self.chat_header.setText("请选择一个设备开始聊天")
-        self.chat_display.setHtml("""
-            <div style="text-align: center; padding: 60px 20px;">
-                <div style="font-size: 48px; margin-bottom: 16px;">💬</div>
-                <div style="font-size: 16px; color: #b2bec3;">
-                    请选择一个设备开始聊天
-                </div>
-                <div style="font-size: 13px; color: #dfe6e9; margin-top: 8px;">
-                    点击左侧设备列表中的设备查看聊天
-                </div>
-            </div>
-        """)
+        self.chat_display.document().addResource(
+            QTextDocument.ImageResource, QUrl('lft://chat'),
+            svg_pixmap('chat', 48, COLORS['primary'])
+        )
+        self.chat_display.setHtml(
+            '<div style="text-align: center; padding: 60px 20px;">'
+            '<div style="margin-bottom: 18px;"><img src="lft://chat" width="48" height="48"></div>'
+            f'<div style="font-size: 15px; color: {COLORS["muted"]};">'
+            '请选择一个设备开始聊天</div>'
+            f'<div style="font-size: 12px; color: {COLORS["subtle"]}; margin-top: 8px;">'
+            '点击左侧设备列表中的设备查看聊天</div>'
+            '</div>'
+        )
 
     def _render_chat_history(self):
         """根据 current_chat_key 渲染聊天历史"""
@@ -826,57 +714,57 @@ class LanChatWindow(QMainWindow):
 
     @staticmethod
     def _build_bubble_html(content, source, is_file=False, timestamp=""):
-        """构造单条消息的 HTML 气泡"""
+        """构造单条消息的 HTML 气泡（配色取自统一视觉令牌）"""
         safe = html.escape(str(content))  # 内容一律转义，防止对端注入 HTML
-        ts_html = ""
-        if timestamp:
-            ts_html = f'<div style="font-size: 10px; color: #b2bec3; margin-top: 2px;">{timestamp}</div>'
 
         if source == 'system':
             return (
                 f'<div style="text-align: center; margin: 6px 0;">'
-                f'<span style="font-size: 11px; color: #b2bec3;">{safe}</span>'
-                f'{ts_html}'
+                f'<span style="font-size: 11px; color: {COLORS["subtle"]};">{safe}</span>'
                 f'</div>'
             )
 
         if source == 'pc':
-            # PC 消息 —— 右对齐，紫色
-            text_color = "white"
-            bg_color = "#6c5ce7"
-            border_radius = "10px 10px 0 10px"
-            align = "right"
-            link_color = "white"
+            # 本机发出 —— 右对齐，主色实心
+            text_color = COLORS['on_primary']
+            bg_color = COLORS['primary']
+            align = 'right'
+            link_color = COLORS['on_primary']
         elif source == 'remote_pc':
-            # 远程 PC 消息 —— 左对齐，浅灰绿
-            text_color = "#2d3436"
-            bg_color = "#e8f5e9"
-            border_radius = "10px 10px 10px 0"
-            align = "left"
-            link_color = "#0984e3"
+            # 远程 PC —— 左对齐，浅绿
+            text_color = COLORS['text']
+            bg_color = COLORS['success_soft']
+            align = 'left'
+            link_color = COLORS['primary']
         else:
-            # 手机消息 —— 左对齐，浅灰
-            text_color = "#2d3436"
-            bg_color = "#f0f0f0"
-            border_radius = "10px 10px 10px 0"
-            align = "left"
-            link_color = "#0984e3"
+            # 手机 —— 左对齐，白底
+            text_color = COLORS['text']
+            bg_color = COLORS['surface']
+            align = 'left'
+            link_color = COLORS['primary']
 
         if is_file:
-            inner = f'📎 <a style="color: {link_color}; text-decoration: underline;" href="#">{safe}</a>'
+            inner = (
+                '文件 · '
+                f'<a style="color: {link_color}; text-decoration: underline;" href="#">{safe}</a>'
+            )
         else:
             inner = safe.replace("\n", "<br>")
 
-        return (
-            f'<div style="text-align: {align}; margin: 5px 0;">'
-            f'<span style="display: inline-block; background-color: {bg_color}; color: {text_color}; '
-            f'padding: 8px 14px; border-radius: {border_radius}; max-width: 70%; '
-            f'word-wrap: break-word; line-height: 1.4;">'
-            f'{inner}'
-            f'</span>'
-            f'{ts_html}'
-            f'</div>'
+        # Qt 富文本不支持 border-radius；div 对齐 + table 底色可稳定画出
+        # 带内边距、宽度贴合内容的扁平气泡
+        bubble = (
+            f'<div align="{align}" style="margin: 6px 0 2px 0;">'
+            f'<table cellpadding="8" cellspacing="0" border="0" bgcolor="{bg_color}">'
+            f'<tr><td><font color="{text_color}">&nbsp;{inner}&nbsp;</font></td></tr>'
+            f'</table></div>'
         )
+        if timestamp:
+            bubble += (
+                f'<div align="{align}" style="font-size: 10px; '
+                f'color: {COLORS["subtle"]}; margin-bottom: 6px;">{timestamp}</div>'
+            )
+        return bubble
 
     def _on_phone_text_source(self, key):
         """记录最近收到手机消息的设备 key"""
@@ -967,22 +855,24 @@ class LanChatWindow(QMainWindow):
     # ================================================================
 
     def _refresh_status_label(self):
-        """服务状态 + 手机连接数一起显示，服务异常时一眼可见。"""
+        """服务状态 + 移动设备连接数一起显示，服务异常时一眼可见。"""
+        ok_style = f"color: {COLORS['success']}; font-weight: 600; font-size: 11px;"
+        err_style = f"color: {COLORS['danger']}; font-weight: 600; font-size: 11px;"
         if not self._service_alive:
-            self.status_label.setText("⚠️ 服务未运行，正在自动恢复")
-            self.status_label.setStyleSheet("color: #d63031; font-weight: bold; font-size: 11px;")
+            self.status_label.setText("服务未运行，正在自动恢复")
+            self.status_label.setStyleSheet(err_style)
             return
         if self.pc_client and self.pc_client._connected:
             self.status_label.setText(f"已连接到 {self.pc_client.target_ip}")
-            self.status_label.setStyleSheet("color: #00b894; font-weight: bold; font-size: 11px;")
+            self.status_label.setStyleSheet(ok_style)
             return
         count = len(srv.phone_sids)
         if count > 0:
-            self.status_label.setText(f"📱 {count} 台手机已连接")
-            self.status_label.setStyleSheet("color: #00b894; font-weight: bold; font-size: 11px;")
+            self.status_label.setText(f"{count} 台移动设备已连接")
+            self.status_label.setStyleSheet(ok_style)
         else:
-            self.status_label.setText("手机未连接")
-            self.status_label.setStyleSheet("color: #d63031; font-weight: bold; font-size: 11px;")
+            self.status_label.setText("移动设备未连接")
+            self.status_label.setStyleSheet(err_style)
 
     def _update_phone_status(self):
         self._refresh_status_label()
@@ -1055,17 +945,17 @@ class LanChatWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("关于 局域网双向传输")
         dialog.setFixedSize(450, 700)
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #f5f6fa;
-            }
-        """)
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
 
-        title_label = QLabel("📡 局域网双向传输")
+        brand = QLabel()
+        brand.setPixmap(svg_pixmap('broadcast', 28, COLORS['primary']))
+        brand.setAlignment(Qt.AlignCenter)
+        layout.addWidget(brand)
+
+        title_label = QLabel("局域网双向传输")
         title_label.setStyleSheet("""
             color: #2d3436;
             font-size: 22px;
@@ -1113,20 +1003,20 @@ class LanChatWindow(QMainWindow):
         line.setStyleSheet("background-color: #dfe6e9; margin: 5px 0;")
         scroll_layout.addWidget(line)
 
-        intro_label = QLabel("🔧 简介")
+        intro_label = QLabel("简介")
         intro_label.setStyleSheet("color: #2d3436; font-size: 15px; font-weight: bold;")
         scroll_layout.addWidget(intro_label)
 
         intro_text = QLabel(
             "一款简洁高效的局域网文件传输工具，"
-            "支持电脑与手机之间的实时消息和文件互传。\n"
+            "支持电脑与移动设备之间的实时消息和文件互传。\n"
             "专为同一网络环境下的快速文件共享而设计。"
         )
         intro_text.setWordWrap(True)
         intro_text.setStyleSheet("color: #636e72; font-size: 13px; line-height: 1.6;")
         scroll_layout.addWidget(intro_text)
 
-        features_label = QLabel("✨ 特性")
+        features_label = QLabel("特性")
         features_label.setStyleSheet("color: #2d3436; font-size: 15px; font-weight: bold;")
         scroll_layout.addWidget(features_label)
 
@@ -1141,7 +1031,7 @@ class LanChatWindow(QMainWindow):
         features_text.setStyleSheet("color: #636e72; font-size: 13px; line-height: 1.8;")
         scroll_layout.addWidget(features_text)
 
-        privacy_label = QLabel("🔒 隐私与安全")
+        privacy_label = QLabel("隐私与安全")
         privacy_label.setStyleSheet("color: #2d3436; font-size: 15px; font-weight: bold;")
         scroll_layout.addWidget(privacy_label)
 
@@ -1165,7 +1055,7 @@ class LanChatWindow(QMainWindow):
         """)
         scroll_layout.addWidget(privacy_text)
 
-        disclaimer_label = QLabel("⚠️ 免责声明")
+        disclaimer_label = QLabel("免责声明")
         disclaimer_label.setStyleSheet("color: #2d3436; font-size: 15px; font-weight: bold;")
         scroll_layout.addWidget(disclaimer_label)
 
@@ -1186,7 +1076,7 @@ class LanChatWindow(QMainWindow):
         """)
         scroll_layout.addWidget(disclaimer_text)
 
-        contact_label = QLabel("📧 联系与反馈")
+        contact_label = QLabel("联系与反馈")
         contact_label.setStyleSheet("color: #2d3436; font-size: 15px; font-weight: bold;")
         scroll_layout.addWidget(contact_label)
 
@@ -1220,6 +1110,7 @@ class LanChatWindow(QMainWindow):
         close_btn.clicked.connect(dialog.close)
         layout.addWidget(close_btn)
 
+        apply_theme(dialog)
         dialog.exec_()
 
     # ================================================================
@@ -1348,7 +1239,7 @@ class LanChatWindow(QMainWindow):
                     srv.socketio.emit('text_message', {'message': text},
                                       to=device.get('sid') or key)
                 except Exception as e:
-                    self.add_message(f"发送到手机失败: {e}", 'system')
+                    self.add_message(f"发送到移动设备失败: {e}", 'system')
 
             elif device['type'] == 'pc':
                 if not (self.pc_client and self.pc_client._connected
@@ -1418,7 +1309,7 @@ class LanChatWindow(QMainWindow):
             if pc_devices:
                 pc_client = self.pc_client
 
-        self.add_message(f"📎 正在发送 {len(file_paths)} 个文件...", 'pc')
+        self.add_message(f"正在发送 {len(file_paths)} 个文件...", 'pc')
         jobs = []
         for file_path in file_paths:
             filename = os.path.basename(file_path)
@@ -1429,7 +1320,7 @@ class LanChatWindow(QMainWindow):
                 if self._emit_to_phone('file_download',
                                        {'url': download_url, 'filename': filename},
                                        device):
-                    self.add_message(f"📎 已发送: {filename}", 'pc', is_file=True)
+                    self.add_message(f"已发送: {filename}", 'pc', is_file=True)
             if pc_client:
                 jobs.append((file_path, pc_client, filename))
 
@@ -1470,7 +1361,7 @@ class LanChatWindow(QMainWindow):
             if pc_devices:
                 pc_client = self.pc_client
 
-        self.add_message(f"📁 正在准备文件夹: {folder_name}（后台压缩）...", 'pc')
+        self.add_message(f"正在准备文件夹: {folder_name}（后台压缩）...", 'pc')
 
         def worker(cancel_event):
             zip_path = None
