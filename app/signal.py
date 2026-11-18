@@ -15,6 +15,7 @@ class SignalEmitter(QObject):
     system_message = pyqtSignal(str)                   # 跨线程安全写入聊天区
     send_progress = pyqtSignal(str, int, int)          # (描述, 已完成字节, 总字节)；空描述表示结束
     pc_message = pyqtSignal(str, str)                  # (内容, 来源 PC 的 IP)
+    transfer_finished = pyqtSignal()                   # 一次后台传输结束（成功/失败/取消均触发）
 
 
 signal_emitter = SignalEmitter()

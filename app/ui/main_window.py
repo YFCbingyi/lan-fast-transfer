@@ -21,6 +21,7 @@ from app.ui.theme import DESKTOP_QSS, COLORS, reduced_motion
 from app.ui.icons import (
     GlowButton, svg_icon, svg_pixmap, apply_theme, fade_widget, height_animation,
 )
+from app import __version__
 from app import server as srv
 from app.signal import signal_emitter
 from app.config import save_config, load_config
@@ -40,7 +41,7 @@ class LanChatWindow(QMainWindow):
         self.current_port = srv.RUNTIME_PORT
         self._service_alive = True
         self._cancel_event = None
-        self.setWindowTitle("局域网双向传输 v2.0")
+        self.setWindowTitle(f"局域网双向传输 v{__version__}")
         self.setGeometry(100, 100, 820, 650)
         self.setMinimumSize(680, 550)
 
@@ -49,6 +50,9 @@ class LanChatWindow(QMainWindow):
         self.chat_history = {}                   # key -> list of dicts
         self.current_chat_key = None             # 当前选中的设备 key
         self._last_phone_key = None              # 最近收到手机消息的设备 key
+        self._folder_queue = []                  # 拖拽发送：待串行发送的文件夹队列
+        self._folder_queue_targets = None
+        self._active_transfers = 0               # 当前后台传输线程数（串行队列用）
 
         # ---- 全局样式：统一视觉令牌（桌面 QSS） ----
         self.setStyleSheet(DESKTOP_QSS)
@@ -100,6 +104,11 @@ class LanChatWindow(QMainWindow):
         self.send_text_btn.clicked.connect(self.send_text)
         self.send_file_btn.clicked.connect(self.send_file)
         self.send_folder_btn.clicked.connect(self.send_folder)
+        # 拖拽发送：消息区穿透到主窗口统一处理；输入框拦截文件拖放（保留文字拖入）
+        self.setAcceptDrops(True)
+        self.chat_display.setAcceptDrops(False)
+        self.chat_display.viewport().setAcceptDrops(False)
+        self.text_input.viewport().installEventFilter(self)
         self.text_input.installEventFilter(self)
 
         signal_emitter.received_text.connect(self.add_message)
@@ -113,6 +122,7 @@ class LanChatWindow(QMainWindow):
         signal_emitter.system_message.connect(self.add_system_message)
         signal_emitter.send_progress.connect(self._on_send_progress)
         signal_emitter.pc_message.connect(self._on_pc_message)
+        signal_emitter.transfer_finished.connect(self._on_transfer_finished)
 
         # 设备发现
         hostname = socket.gethostname()
@@ -448,6 +458,7 @@ class LanChatWindow(QMainWindow):
 
     def _start_transfer(self, worker):
         self._cancel_event = threading.Event()
+        self._active_transfers += 1
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setVisible(True)
         self.statusBar().showMessage("准备传输…")
@@ -459,6 +470,7 @@ class LanChatWindow(QMainWindow):
                 signal_emitter.system_message.emit(f"传输失败: {e}")
             finally:
                 signal_emitter.send_progress.emit('', 0, 0)
+                signal_emitter.transfer_finished.emit()
 
         threading.Thread(target=run, daemon=True, name='FileTransfer').start()
 
@@ -915,6 +927,19 @@ class LanChatWindow(QMainWindow):
             if event.key() == Qt.Key_Return and not (event.modifiers() & Qt.ControlModifier):
                 self.send_text()
                 return True
+        # 输入框：文件/文件夹拖放触发发送，文字拖入仍走 QTextEdit 原生行为
+        if obj is self.text_input.viewport() and event.type() in (
+                QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            if event.mimeData().hasUrls():
+                if event.type() == QEvent.Drop:
+                    paths = [u.toLocalFile() for u in event.mimeData().urls()
+                             if u.isLocalFile()]
+                    event.acceptProposedAction()
+                    if paths:
+                        self._send_dropped_paths(paths)
+                else:
+                    event.acceptProposedAction()
+                return True
         return super().eventFilter(obj, event)
 
     # ================================================================
@@ -965,7 +990,7 @@ class LanChatWindow(QMainWindow):
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
 
-        version_label = QLabel("版本 v2.0")
+        version_label = QLabel(f"版本 v{__version__}")
         version_label.setStyleSheet("""
             color: #636e72;
             font-size: 14px;
@@ -1286,6 +1311,58 @@ class LanChatWindow(QMainWindow):
             return
 
         self._send_folder_to_targets(folder_path, target_keys)
+
+    # ================================================================
+    # 拖拽发送（窗口任意位置拖入文件 / 文件夹）
+    # ================================================================
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        paths = [u.toLocalFile() for u in event.mimeData().urls()
+                 if u.isLocalFile()]
+        event.acceptProposedAction()
+        if paths:
+            self._send_dropped_paths(paths)
+
+    def _send_dropped_paths(self, paths):
+        """拖拽发送：文件批量走文件发送，文件夹逐个排队串行压缩发送，共用一次设备选择。"""
+        files = [p for p in paths if os.path.isfile(p)]
+        folders = [p for p in paths if os.path.isdir(p)]
+        if not files and not folders:
+            return
+        if not self.devices:
+            self.add_message("没有已连接的设备，无法发送拖入的内容", 'system')
+            return
+        target_keys = self._get_target_keys(force_dialog=True)
+        if not target_keys:
+            return
+
+        if files:
+            self._send_file_to_targets(files, target_keys)
+        if folders:
+            self._folder_queue = folders
+            self._folder_queue_targets = target_keys
+            # 兜底触发：若文件批无后台传输（仅发手机），队列需要这里启动
+            QTimer.singleShot(0, self._send_next_queued_folder)
+
+    def _send_next_queued_folder(self):
+        """仅在没有后台传输时启动下一个文件夹，避免并发覆盖进度/取消。"""
+        if self._folder_queue and self._active_transfers == 0:
+            folder_path = self._folder_queue.pop(0)
+            self._send_folder_to_targets(folder_path, self._folder_queue_targets)
+
+    def _on_transfer_finished(self):
+        self._active_transfers = max(0, self._active_transfers - 1)
+        if self._active_transfers == 0:
+            self._send_next_queued_folder()
 
     # ================================================================
     # 实际发送逻辑

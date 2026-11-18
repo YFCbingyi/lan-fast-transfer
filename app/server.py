@@ -12,6 +12,7 @@ from flask import Flask, request, send_from_directory, render_template_string, R
 from flask_socketio import SocketIO
 import engineio.async_drivers.gevent
 
+from app import __version__
 from app.config import load_config, DEFAULT_DOWNLOAD_FOLDER
 from app.signal import signal_emitter
 from app.ui.theme import apply_phone_tokens
@@ -102,7 +103,7 @@ PHONE_PAGE = """
     <div class="about-modal" id="aboutModal">
         <div class="about-content">
             <div class="about-title">__ICON_LOGO_LIGHT__局域网双向传输</div>
-            <div class="about-version">版本 v2.0</div>
+            <div class="about-version">版本 v__APP_VERSION__</div>
 
             <div class="about-section">
                 <div class="about-section-title">__ICON_INFO_SECTION__简介</div>
@@ -547,6 +548,7 @@ PHONE_PAGE = """
 
 # CSS / 线性图标 / 旧状态文案统一由视觉令牌注入，服务端只保留页面结构与协议逻辑
 PHONE_PAGE = apply_phone_tokens(PHONE_PAGE)
+PHONE_PAGE = PHONE_PAGE.replace('__APP_VERSION__', __version__)
 
 
 @app.route('/')
