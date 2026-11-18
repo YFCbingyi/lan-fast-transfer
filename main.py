@@ -29,9 +29,12 @@ if __name__ == '__main__':
     flask_thread = threading.Thread(target=start_flask, daemon=True, name='TransferServer')
     flask_thread.start()
 
+    from PyQt5.QtGui import QIcon
     from PyQt5.QtWidgets import QApplication
 
     qt_app = QApplication(sys.argv)
+    icon_base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    qt_app.setWindowIcon(QIcon(os.path.join(icon_base, 'icon', 'icon.ico')))
     window = LanChatWindow(DOWNLOAD_FOLDER)
     window.show()
     sys.exit(qt_app.exec_())
